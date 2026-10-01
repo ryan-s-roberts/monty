@@ -1,7 +1,10 @@
+# Monty profile: class factories follow Type::call_class_method; unsupported
+# CPython factories are absent rather than accepted through an unknown descriptor.
+# Monty does not preserve nonzero DST fold, so signatures admit only fold=0.
 import sys
 from abc import abstractmethod
 from time import struct_time
-from typing import ClassVar, Final, NoReturn, SupportsIndex, final, overload, type_check_only
+from typing import ClassVar, Final, Literal, NoReturn, SupportsIndex, final, overload, type_check_only
 
 from typing_extensions import CapsuleType, Self, TypeAlias, deprecated, disjoint_base
 
@@ -59,15 +62,9 @@ class date:
     resolution: ClassVar[timedelta]
     def __new__(cls, year: SupportsIndex, month: SupportsIndex, day: SupportsIndex) -> Self: ...
     @classmethod
-    def fromtimestamp(cls, timestamp: float, /) -> Self: ...
-    @classmethod
     def today(cls) -> Self: ...
     @classmethod
-    def fromordinal(cls, n: int, /) -> Self: ...
-    @classmethod
     def fromisoformat(cls, date_string: str, /) -> Self: ...
-    @classmethod
-    def fromisocalendar(cls, year: int, week: int, day: int) -> Self: ...
     @property
     def year(self) -> int: ...
     @property
@@ -129,7 +126,7 @@ class time:
         microsecond: SupportsIndex = 0,
         tzinfo: _TzInfo | None = None,
         *,
-        fold: int = 0,
+        fold: Literal[0] = 0,
     ) -> Self: ...
     @property
     def hour(self) -> int: ...
@@ -179,7 +176,7 @@ class time:
             second: SupportsIndex = ...,
             microsecond: SupportsIndex = ...,
             tzinfo: _TzInfo | None = ...,
-            fold: int = ...,
+            fold: Literal[0] = ...,
         ) -> Self: ...
 
     def replace(
@@ -190,7 +187,7 @@ class time:
         microsecond: SupportsIndex = ...,
         tzinfo: _TzInfo | None = ...,
         *,
-        fold: int = ...,
+        fold: Literal[0] = ...,
     ) -> Self: ...
 
 _Date: TypeAlias = date
@@ -260,7 +257,7 @@ class datetime(date):
         microsecond: SupportsIndex = 0,
         tzinfo: _TzInfo | None = None,
         *,
-        fold: int = 0,
+        fold: Literal[0] = 0,
     ) -> Self: ...
     @property
     def hour(self) -> int: ...
@@ -274,26 +271,8 @@ class datetime(date):
     def tzinfo(self) -> _TzInfo | None: ...
     @property
     def fold(self) -> int: ...
-    # On <3.12, the name of the first parameter in the pure-Python implementation
-    # didn't match the name in the C implementation,
-    # meaning it is only *safe* to pass it as a keyword argument on 3.12+
-    if sys.version_info >= (3, 12):
-        @classmethod
-        def fromtimestamp(cls, timestamp: float, tz: _TzInfo | None = None) -> Self: ...
-    else:
-        @classmethod
-        def fromtimestamp(cls, timestamp: float, /, tz: _TzInfo | None = None) -> Self: ...
-
-    @classmethod
-    @deprecated(
-        'Use timezone-aware objects to represent datetimes in UTC; e.g. by calling .fromtimestamp(datetime.timezone.utc)'
-    )
-    def utcfromtimestamp(cls, t: float, /) -> Self: ...
     @classmethod
     def now(cls, tz: _TzInfo | None = None) -> Self: ...
-    @classmethod
-    @deprecated('Use timezone-aware objects to represent datetimes in UTC; e.g. by calling .now(datetime.timezone.utc)')
-    def utcnow(cls) -> Self: ...
     @classmethod
     def combine(cls, date: _Date, time: _Time, tzinfo: _TzInfo | None = ...) -> Self: ...
     def timestamp(self) -> float: ...
@@ -314,7 +293,7 @@ class datetime(date):
             second: SupportsIndex = ...,
             microsecond: SupportsIndex = ...,
             tzinfo: _TzInfo | None = ...,
-            fold: int = ...,
+            fold: Literal[0] = ...,
         ) -> Self: ...
 
     def replace(
@@ -328,7 +307,7 @@ class datetime(date):
         microsecond: SupportsIndex = ...,
         tzinfo: _TzInfo | None = ...,
         *,
-        fold: int = ...,
+        fold: Literal[0] = ...,
     ) -> Self: ...
     def astimezone(self, tz: _TzInfo | None = None) -> Self: ...
     def isoformat(self, sep: str = 'T', timespec: str = 'auto') -> str: ...

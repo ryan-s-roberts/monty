@@ -277,6 +277,8 @@ pub struct ClassTypeNode {
     pub host_defined: bool,
     /// Whether `dataclasses.is_dataclass` is true for the class.
     pub is_dataclass: bool,
+    /// Expose eagerly stored instance fields through string-key subscripting.
+    pub record_access: bool,
     /// Eagerly-sent class attributes as `(name, value)` id pairs.
     pub attrs: Vec<(NodeId, NodeId)>,
 }

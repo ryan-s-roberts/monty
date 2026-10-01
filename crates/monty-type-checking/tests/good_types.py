@@ -510,7 +510,6 @@ check_str(dt_date.ctime())
 # date classmethods (return Unknown due to type checker limitations)
 datetime.date.today()
 datetime.date.fromisoformat('2024-01-15')
-datetime.date.fromordinal(738900)
 
 # date replace
 dt_replaced = dt_date.replace(year=2025)
@@ -586,7 +585,6 @@ assert_type(dt_t, datetime.time)
 # datetime classmethods (return Unknown due to type checker limitations)
 datetime.datetime.now()
 datetime.datetime.strptime('2024-01-15', '%Y-%m-%d')
-datetime.datetime.fromtimestamp(1000000.0)
 
 # datetime replace
 dt_rep = dt.replace(year=2025)

@@ -248,6 +248,8 @@ message Type {
   // attrs, an empty set leaves them unchanged. The worker never sends attrs
   // for a sandbox class.
   NodePairs attrs = 5;
+  // Host records expose eager fields by string-key indexing.
+  bool record_access = 6;
 }
 
 // A class instance crossing the sandbox boundary. Host-backed instances route

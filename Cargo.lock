@@ -2524,6 +2524,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "monty-analysis"
+version = "1.0.0"
+dependencies = [
+ "monty-type-checking",
+ "monty-types",
+ "ruff_db",
+ "ruff_python_ast",
+ "ruff_text_size",
+ "ty_python_semantic",
+]
+
+[[package]]
 name = "monty-apidoc"
 version = "1.0.0"
 dependencies = [
@@ -2705,6 +2717,7 @@ dependencies = [
  "ruff_python_ast",
  "ruff_text_size",
  "salsa",
+ "salsa-macro-rules",
  "ty_module_resolver",
  "ty_python_core",
  "ty_python_semantic",
@@ -5165,8 +5178,6 @@ dependencies = [
 [[package]]
 name = "ty_python_semantic"
 version = "0.0.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7adcef02a5cffcc52863ba0f5928ad7451f8e5403082d234bbe1dff91f5d7a89"
 dependencies = [
  "bitflags 2.13.2",
  "char_str",

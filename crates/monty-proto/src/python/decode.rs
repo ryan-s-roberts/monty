@@ -252,5 +252,6 @@ fn class_header(class: &ClassTypeNode) -> ClassHeader {
         id: class.id,
         host_defined: class.host_defined,
         is_dataclass: class.is_dataclass,
+        record_access: class.record_access,
     }
 }

@@ -501,6 +501,7 @@ impl GraphExporter {
             id: vm.heap.boundary_uuid(class_id),
             host_defined: false,
             is_dataclass: dataclasses::is_dataclass_class(class_id, vm),
+            record_access: false,
             attrs: Vec::new(),
         }));
         let node_id = self.push_node(node);
@@ -536,6 +537,7 @@ impl GraphExporter {
             id: class_type.id,
             host_defined: true,
             is_dataclass: class_type.is_dataclass,
+            record_access: class_type.record_access,
             attrs,
         })));
         if !self.in_progress.contains(&type_id) {
@@ -952,7 +954,8 @@ fn import_node(
             }
             _ if class.host_defined => {
                 let attrs = clone_pairs(&class.attrs, built, vm);
-                intern_host_class_type(class.name, class.id, class.is_dataclass, attrs, vm).map(Value::Ref)
+                intern_host_class_type(class.name, class.id, class.is_dataclass, class.record_access, attrs, vm)
+                    .map(Value::Ref)
             }
             _ => Err(InvalidInputError::invalid_type(format!(
                 "sandbox class '{}' (id {}) no longer exists",
@@ -983,8 +986,14 @@ fn import_node(
                 let mut dict_guard = DropGuard::new(dict, vm);
                 let (_, vm) = dict_guard.as_parts_mut();
                 let class_attrs = clone_pairs(&class.attrs, built, vm);
-                let class_id =
-                    intern_host_class_type(class.name.clone(), class.id, class.is_dataclass, class_attrs, vm)?;
+                let class_id = intern_host_class_type(
+                    class.name.clone(),
+                    class.id,
+                    class.is_dataclass,
+                    class.record_access,
+                    class_attrs,
+                    vm,
+                )?;
                 let (dict, vm) = dict_guard.into_parts();
                 let hc = HostClass::new(instance_id, class_id, dict);
                 Ok(Value::Ref(vm.heap.allocate(HeapData::HostClass(Box::new(hc)))))
@@ -1059,6 +1068,7 @@ fn intern_host_class_type(
     name: String,
     type_id: MontyUuid,
     is_dataclass: bool,
+    record_access: bool,
     attr_pairs: Vec<(Value, Value)>,
     vm: &mut VM<'_>,
 ) -> Result<HeapId, InvalidInputError> {
@@ -1072,13 +1082,13 @@ fn intern_host_class_type(
                 unreachable!("host_type_index points at a non-host-class-type entry");
             };
             let replaced = (!attrs.is_empty()).then_some(attrs);
-            let old_attrs = ty.update_from_wire(name, is_dataclass, replaced, vm.heap);
+            let old_attrs = ty.update_from_wire(name, is_dataclass, record_access, replaced, vm.heap);
             old_attrs.drop_with(vm);
             Ok(class_id)
         }
         None => Ok(vm
             .heap
-            .allocate_host_type(HostClassType::new(name, type_id, is_dataclass, attrs))),
+            .allocate_host_type(HostClassType::new(name, type_id, is_dataclass, record_access, attrs))),
     }
 }
 

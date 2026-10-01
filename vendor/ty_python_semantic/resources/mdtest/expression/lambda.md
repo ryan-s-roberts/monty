@@ -1,0 +1,177 @@
+# `lambda` expression
+
+## No parameters
+
+`lambda` expressions can be defined without any parameters.
+
+```py
+reveal_type(lambda: 1)  # revealed: () -> Literal[1]
+
+# error: [unresolved-reference]
+reveal_type(lambda: a)  # revealed: () -> Unknown
+```
+
+## With parameters
+
+Unlike parameters in function definition, the parameters in a `lambda` expression cannot be
+annotated.
+
+```py
+reveal_type(lambda a: a)  # revealed: (a) -> Unknown
+reveal_type(lambda a, b: a + b)  # revealed: (a, b) -> Unknown
+```
+
+But, it can have default values:
+
+```py
+reveal_type(lambda a=1: a)  # revealed: (a=1) -> Unknown | Literal[1]
+reveal_type(lambda a, b=2: a)  # revealed: (a, b=2) -> Unknown
+```
+
+And, positional-only parameters:
+
+```py
+reveal_type(lambda a, b, /, c: c)  # revealed: (a, b, /, c) -> Unknown
+```
+
+And, keyword-only parameters:
+
+```py
+reveal_type(lambda a, *, b=2, c: b)  # revealed: (a, *, b=2, c) -> Unknown | Literal[2]
+```
+
+And, variadic parameter:
+
+```py
+reveal_type(lambda *args: args)  # revealed: (*args) -> tuple[Unknown, ...]
+```
+
+And, keyword-variadic parameter:
+
+```py
+reveal_type(lambda **kwargs: kwargs)  # revealed: (**kwargs) -> dict[str, Unknown]
+```
+
+Mixing all of them together:
+
+```py
+# revealed: (a, b, /, c=True, *args, d="default", e=5, **kwargs) -> None
+reveal_type(lambda a, b, /, c=True, *args, d="default", e=5, **kwargs: None)
+```
+
+## Parameter type
+
+In addition to correctly inferring the `lambda` expression, the parameters should also be inferred
+correctly.
+
+Using a parameter with no default value:
+
+```py
+lambda x: reveal_type(x)  # revealed: Unknown
+```
+
+Using a parameter with default value:
+
+```py
+lambda x=1: reveal_type(x)  # revealed: Unknown | Literal[1]
+```
+
+Using a variadic parameter:
+
+```py
+lambda *args: reveal_type(args)  # revealed: tuple[Unknown, ...]
+```
+
+Using a keyword-variadic parameter:
+
+```py
+lambda **kwargs: reveal_type(kwargs)  # revealed: dict[str, Unknown]
+```
+
+## Nested `lambda` expressions
+
+Here, a `lambda` expression is used as the default value for a parameter in another `lambda`
+expression.
+
+```py
+reveal_type(lambda a=lambda x, y: 0: 2)  # revealed: (a=...) -> Literal[2]
+```
+
+## Defaults in string annotations
+
+`Annotated` metadata can contain lambdas. Names in their default values must still be resolved in
+the enclosing string annotation, whose expressions are not part of the module's semantic index.
+
+```py
+from typing_extensions import Annotated
+
+def f(value: "Annotated[int, lambda default=int: None]"):
+    reveal_type(value)  # revealed: int
+
+# error: [unresolved-reference]
+def invalid(value: "Annotated[int, lambda default=missing: None]"): ...
+```
+
+Nested lambdas must retain the same context. Dynamic classes created in a default value also need
+the original string annotation as their source anchor.
+
+```py
+def nested(value: "Annotated[int, lambda outer=(lambda inner=int: None): None]"):
+    reveal_type(value)  # revealed: int
+
+def dynamic(value: "Annotated[int, lambda default=type('C', (), {}): None]"):
+    reveal_type(value)  # revealed: int
+```
+
+## Defaults in stub string annotations
+
+Stub files must preserve the string-annotation context too, including for positional-only and
+keyword-only defaults.
+
+```pyi
+from typing_extensions import Annotated
+
+value: "Annotated[int, lambda positional=int, /, normal=str, *, keyword=bytes: None]"
+reveal_type(value)  # revealed: int
+```
+
+## Assignment
+
+This does not enumerate all combinations of parameter kinds as that should be covered by the
+[subtype tests for callable types](./../type_properties/is_subtype_of.md#callable).
+
+```py
+from typing import Callable
+
+a1: Callable[[], None] = lambda: None
+a2: Callable[[int], None] = lambda x: None
+a3: Callable[[int, int], None] = lambda x, y, z=1: None
+a4: Callable[[int, int], None] = lambda *args: None
+
+# error: [invalid-assignment]
+a5: Callable[[], None] = lambda x: None
+# error: [invalid-assignment]
+a6: Callable[[int], None] = lambda: None
+
+# error: [invalid-assignment]
+a7: Callable[[], str] = lambda: 1
+```
+
+## Function-like behavior of lambdas
+
+All `lambda` functions are instances of `types.FunctionType` and should have access to the same set
+of attributes.
+
+```py
+x = lambda y: y
+
+reveal_type(x.__code__)  # revealed: CodeType
+reveal_type(x.__name__)  # revealed: str
+reveal_type(x.__defaults__)  # revealed: tuple[Any, ...] | None
+reveal_type(x.__annotations__)  # revealed: dict[str, Any]
+reveal_type(x.__dict__)  # revealed: dict[str, Any]
+reveal_type(x.__doc__)  # revealed: str | None
+reveal_type(x.__kwdefaults__)  # revealed: dict[str, Any] | None
+reveal_type(x.__module__)  # revealed: str
+reveal_type(x.__qualname__)  # revealed: str
+```

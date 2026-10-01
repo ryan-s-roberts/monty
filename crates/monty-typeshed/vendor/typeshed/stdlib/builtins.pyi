@@ -45,6 +45,7 @@ from _typeshed import (
     SupportsWrite,
 )
 from typing_extensions import (
+    Concatenate,
     Literal,
     LiteralString,
     ParamSpec,
@@ -1493,3 +1494,22 @@ if sys.version_info >= (3, 11):
     _BaseExceptionT = TypeVar('_BaseExceptionT', bound=BaseException)
     _ExceptionT_co = TypeVar('_ExceptionT_co', bound=Exception, covariant=True, default=Exception)
     _ExceptionT = TypeVar('_ExceptionT', bound=Exception)
+
+
+# Standard-library stubs depend on these descriptors even when user-defined
+# descriptors are outside the interpreter's execution profile.
+class classmethod(Generic[_T, _P, _R_co]):
+    @property
+    def __func__(self) -> Callable[Concatenate[type[_T], _P], _R_co]: ...
+    def __init__(self, f: Callable[Concatenate[type[_T], _P], _R_co], /) -> None: ...
+    @overload
+    def __get__(self, instance: _T, owner: type[_T] | None = None, /) -> Callable[_P, _R_co]: ...
+    @overload
+    def __get__(self, instance: None, owner: type[_T], /) -> Callable[_P, _R_co]: ...
+
+class staticmethod(Generic[_P, _R_co]):
+    @property
+    def __func__(self) -> Callable[_P, _R_co]: ...
+    def __init__(self, f: Callable[_P, _R_co], /) -> None: ...
+    def __get__(self, instance: object, owner: type | None = None, /) -> Callable[_P, _R_co]: ...
+    def __call__(self, *args: _P.args, **kwargs: _P.kwargs) -> _R_co: ...

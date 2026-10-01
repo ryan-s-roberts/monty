@@ -457,3 +457,16 @@ fn collections_unimplemented_names_are_unresolved() {
       |                                                                    ^^^^^^^^^^
     ");
 }
+
+#[test]
+fn unsupported_datetime_factories_are_rejected() {
+    for expression in [
+        "datetime.date.fromordinal(738900)",
+        "datetime.datetime.fromtimestamp(1000000.0)",
+    ] {
+        let source = format!("import datetime\n{expression}\n");
+        let diagnostics =
+            check(&source, "datetime_profile.py").expect("unsupported runtime factories must fail static checking");
+        assert!(diagnostics.contains("unresolved-attribute"), "{diagnostics}");
+    }
+}

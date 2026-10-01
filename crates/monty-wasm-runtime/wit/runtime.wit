@@ -93,6 +93,7 @@ interface worker {
         id: string,
         host-defined: bool,
         is-dataclass: bool,
+        record-access: bool,
         /// Eagerly-sent class attributes (class constants), as a class value
         /// or as the class-type of an instance; a non-empty set refreshes the
         /// sandbox's type object. Empty when the worker sends an instance.

@@ -214,6 +214,7 @@ fn node_from_component(node: ValueNode) -> Result<MontyNode, String> {
             id: parse_uuid(&value.id)?,
             host_defined: value.host_defined,
             is_dataclass: value.is_dataclass,
+            record_access: value.record_access,
             attrs: id_pairs(value.attrs),
         })),
         ValueNode::BuiltinFunction(value) => MontyNode::BuiltinFunction(
@@ -311,6 +312,7 @@ fn node_into_component(node: MontyNode) -> ValueNode {
             id: class.id.to_string(),
             host_defined: class.host_defined,
             is_dataclass: class.is_dataclass,
+            record_access: class.record_access,
             attrs: raw_pairs(class.attrs),
         }),
         MontyNode::BuiltinFunction(value) => ValueNode::BuiltinFunction(value.to_string()),

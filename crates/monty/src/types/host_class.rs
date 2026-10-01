@@ -258,6 +258,22 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, HostClass> {
         }
     }
 
+    /// Looks up an eager field on an explicitly declared host record.
+    fn py_getitem(&self, key: &Value, vm: &mut VM<'h>) -> RunResult<Value> {
+        let instance = self.get(vm.heap);
+        if !host_class_type(vm.heap, instance.class_id).record_access {
+            return Err(ExcType::type_error(format!(
+                "'{}' object is not subscriptable",
+                instance.name(vm.heap, vm.interns)
+            )));
+        }
+        let name = key.to_str_heap(vm.heap, vm.interns)?;
+        match self.get(vm.heap).attrs.get_by_str(name, vm.heap, vm.interns) {
+            Some(value) => Ok(value.clone_with_heap(vm.heap)),
+            None => Err(ExcType::key_error(key, vm)),
+        }
+    }
+
     /// Resolves `obj.attr`: eager attrs first, then a lazy host lookup.
     ///
     /// A public name missing from attrs suspends as [`CallResult::AttrLookup`]
@@ -370,6 +386,7 @@ pub(crate) struct HostClassType {
     type_id: MontyUuid,
     /// Whether `dataclasses.is_dataclass` is true for the class.
     is_dataclass: bool,
+    record_access: bool,
     /// Eagerly-sent class attributes (class constants). Excluded from
     /// equality/hash, which go by class identity alone.
     attrs: Dict,
@@ -379,11 +396,12 @@ impl HostClassType {
     /// Creates the type object for a host class from its wire identity and
     /// the already-converted eager class attrs.
     #[must_use]
-    pub fn new(name: EitherStr, type_id: MontyUuid, is_dataclass: bool, attrs: Dict) -> Self {
+    pub fn new(name: EitherStr, type_id: MontyUuid, is_dataclass: bool, record_access: bool, attrs: Dict) -> Self {
         Self {
             name,
             type_id,
             is_dataclass,
+            record_access,
             attrs,
         }
     }
@@ -423,6 +441,7 @@ impl HostClassType {
             id: self.type_id,
             host_defined: true,
             is_dataclass: self.is_dataclass,
+            record_access: self.record_access,
             attrs: Vec::new(),
         }
     }
@@ -445,12 +464,14 @@ impl<'h> HeapRead<'h, HostClassType> {
         &mut self,
         name: EitherStr,
         is_dataclass: bool,
+        record_access: bool,
         attrs: Option<Dict>,
         heap: &mut HeapReader<'h>,
     ) -> Option<Dict> {
         let ty = self.get_mut(heap);
         ty.name = name;
         ty.is_dataclass = is_dataclass;
+        ty.record_access = record_access;
         attrs.map(|attrs| mem::replace(&mut ty.attrs, attrs))
     }
 }

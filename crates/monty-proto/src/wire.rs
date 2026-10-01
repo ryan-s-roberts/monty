@@ -622,6 +622,11 @@ fn class_type_len(class: &ClassTypeNode) -> usize {
         } else {
             0
         }
+        + if class.record_access {
+            encoding::bool::encoded_len(6, &true)
+        } else {
+            0
+        }
         + if class.attrs.is_empty() {
             0
         } else {
@@ -639,6 +644,9 @@ fn encode_class_type(class: &ClassTypeNode, buf: &mut impl BufMut) {
     if !class.attrs.is_empty() {
         encode_message_key(5, node_pairs_len(1, &class.attrs), buf);
         encode_node_pairs(1, &class.attrs, buf);
+    }
+    if class.record_access {
+        encoding::bool::encode(6, &true, buf);
     }
 }
 
@@ -1040,6 +1048,9 @@ fn type_to_node(ty: pb::Type) -> Result<MontyNode, DecodeError> {
             reason: reason.to_owned(),
         })
     };
+    if ty.record_access && origin != pb::TypeOrigin::Host {
+        return Err(invalid("record access requires a host type"));
+    }
     match origin {
         pb::TypeOrigin::Unspecified => Err(invalid("origin must be specified")),
         pb::TypeOrigin::Builtin => {
@@ -1060,6 +1071,7 @@ fn type_to_node(ty: pb::Type) -> Result<MontyNode, DecodeError> {
                 id: pb_uuid_to_monty(&id, "Type.id")?,
                 host_defined: origin == pb::TypeOrigin::Host,
                 is_dataclass: ty.is_dataclass,
+                record_access: ty.record_access,
                 attrs: ty.attrs.map(|attrs| attrs.0.into_inner()).unwrap_or_default(),
             })?))
         }

@@ -26,6 +26,9 @@ ty_python_semantic = { workspace = true }
 ty_python_core = { workspace = true }
 ty_module_resolver = { workspace = true }
 salsa = { workspace = true }
+# Salsa 0.28.2 uses this crate through a caret requirement despite an unstable macro ABI.
+# Keep consuming workspaces on the same tested pair as the standalone lockfile.
+salsa-macro-rules = "=0.28.2"
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

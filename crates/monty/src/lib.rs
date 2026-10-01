@@ -37,6 +37,13 @@ mod source_nesting;
 mod str_format;
 mod string_builder;
 mod stringize;
+
+/// Render an expression AST without executing it. Useful to hosts that seal
+/// captures before compiling an expression. The AST follows the pinned Ruff version.
+#[must_use]
+pub fn expression_source(expression: &ruff_python_ast::Expr) -> String {
+    stringize::stringize_annotation(&mut expression.clone())
+}
 mod types;
 mod value;
 mod virtual_path;

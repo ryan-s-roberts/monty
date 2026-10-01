@@ -1,0 +1,977 @@
+# While loops
+
+## Basic `while` loop
+
+```py
+def _(flag: bool):
+    x = 1
+    while flag:
+        x = 2
+
+    reveal_type(x)  # revealed: Literal[1, 2]
+```
+
+## `while` with `else` (no `break`)
+
+```py
+def _(flag: bool):
+    x = 1
+    while flag:
+        x = 2
+    else:
+        reveal_type(x)  # revealed: Literal[1, 2]
+        x = 3
+
+    reveal_type(x)  # revealed: Literal[3]
+```
+
+## `while` with `else` (may `break`)
+
+```py
+def _(flag: bool, flag2: bool):
+    x = 1
+    y = 0
+    while flag:
+        x = 2
+        if flag2:
+            y = 4
+            break
+    else:
+        y = x
+        x = 3
+
+    reveal_type(x)  # revealed: Literal[2, 3]
+    reveal_type(y)  # revealed: Literal[4, 1, 2]
+```
+
+## Nested `while` loops
+
+```py
+def flag() -> bool:
+    return True
+
+x = 1
+
+while flag():
+    x = 2
+
+    while flag():
+        x = 3
+        if flag():
+            break
+    else:
+        x = 4
+
+    if flag():
+        break
+else:
+    x = 5
+
+reveal_type(x)  # revealed: Literal[3, 4, 5]
+```
+
+## Boundness
+
+Make sure that the boundness information is correctly tracked in `while` loop control flow.
+
+### Basic `while` loop
+
+```py
+def _(flag: bool):
+    while flag:
+        x = 1
+
+    # error: [possibly-unresolved-reference]
+    x
+```
+
+### `while` with `else` (no `break`)
+
+```py
+def _(flag: bool):
+    while flag:
+        y = 1
+    else:
+        x = 1
+
+    # no error, `x` is always bound
+    x
+    # error: [possibly-unresolved-reference]
+    y
+```
+
+### `while` with `else` (may `break`)
+
+```py
+def _(flag: bool, flag2: bool):
+    while flag:
+        x = 1
+        if flag2:
+            break
+    else:
+        y = 1
+
+    # error: [possibly-unresolved-reference]
+    x
+    # error: [possibly-unresolved-reference]
+    y
+```
+
+## Condition with object that implements `__bool__` incorrectly
+
+```py
+class NotBoolable:
+    __bool__: int = 3
+
+# error: [unsupported-bool-conversion] "Boolean conversion is not supported for type `NotBoolable`"
+while NotBoolable():
+    pass
+```
+
+## Walrus definitions in the condition are always evaluated
+
+```py
+while x := False:
+    pass
+reveal_type(x)  # revealed: Literal[False]
+```
+
+## Cyclic control flow
+
+### Basic
+
+```py
+def random() -> bool:
+    return False
+
+i = 0
+reveal_type(i)  # revealed: Literal[0]
+while random():
+    i += 1
+    reveal_type(i)  # revealed: int
+reveal_type(i)  # revealed: int
+```
+
+### A binding that didn't exist before the loop started
+
+```py
+i = 0
+while i < 1_000_000:
+    if i > 0:
+        loop_only += 1  # error: [possibly-unresolved-reference]
+    if i == 0:
+        loop_only = 0
+    i += 1
+# error: [possibly-unresolved-reference]
+reveal_type(loop_only)  # revealed: int
+```
+
+### A more complex example
+
+Here the loop condition narrows both the loop-back value and the end-of-loop value:
+
+```py
+def random() -> bool:
+    return False
+
+x = "A"
+while x != "C":
+    reveal_type(x)  # revealed: Literal["A", "B"]
+    if random():
+        x = "B"
+    else:
+        x = "C"
+    reveal_type(x)  # revealed: Literal["B", "C"]
+reveal_type(x)  # revealed: Literal["C"]
+```
+
+### An even more complex example
+
+```py
+def random() -> bool:
+    return False
+
+x = "A"
+while x != "E":
+    reveal_type(x)  # revealed: Literal["A", "C", "D"]
+    while x != "C":
+        reveal_type(x)  # revealed: Literal["A", "D", "B"]
+        if random():
+            x = "B"
+        else:
+            x = "C"
+        reveal_type(x)  # revealed: Literal["B", "C"]
+    reveal_type(x)  # revealed: Literal["C"]
+    if random():
+        x = "D"
+    if random():
+        x = "E"
+    reveal_type(x)  # revealed: Literal["C", "D", "E"]
+reveal_type(x)  # revealed: Literal["E"]
+```
+
+### `break` and `continue`
+
+```py
+def random() -> bool:
+    return False
+
+x = "A"
+while True:
+    reveal_type(x)  # revealed: Literal["A", "C", "D"]
+    while True:
+        reveal_type(x)  # revealed: Literal["A", "C", "D", "B"]
+        if random():
+            x = "B"
+            continue
+        else:
+            x = "C"
+            break
+        reveal_type(x)  # revealed: Never
+    reveal_type(x)  # revealed: Literal["C"]
+    if random():
+        x = "D"
+        continue
+    if random():
+        x = "E"
+        break
+    reveal_type(x)  # revealed: Literal["C"]
+reveal_type(x)  # revealed: Literal["E"]
+```
+
+### Interaction between `break` and a narrowing condition
+
+Here the loop condition forces `x` to be `False` at loop exit, because there is no `break`:
+
+```py
+def random() -> bool:
+    return True
+
+x = random()
+reveal_type(x)  # revealed: bool
+while x:
+    pass
+reveal_type(x)  # revealed: Literal[False]
+```
+
+However, we can't narrow `x` like this when there's a `break` in the loop:
+
+```py
+x = random()
+while x:
+    if random():
+        break
+reveal_type(x)  # revealed: bool
+```
+
+### Non-static loop conditions
+
+```py
+def random() -> bool:
+    return False
+
+x = "A"
+while random():
+    reveal_type(x)  # revealed: Literal["A", "B", "C", "D"]
+    x = "B"
+    if random():
+        x = "C"
+    if x == "C":
+        continue
+    reveal_type(x)  # revealed: Literal["B"]
+    while random():
+        reveal_type(x)  # revealed: Literal["B", "D"]
+        if random():
+            x = "D"
+            continue
+        x = "E"
+        break
+    reveal_type(x)  # revealed: Literal["B", "D", "E"]
+    if x == "E":
+        break
+    reveal_type(x)  # revealed: Literal["B", "D"]
+reveal_type(x)  # revealed: Literal["A", "B", "C", "D", "E"]
+```
+
+### Functions and classes defined in loops count as bindings and are visible via loopback
+
+```py
+def random() -> bool:
+    return False
+
+foo = None
+Bar = None
+while random():
+    reveal_type(foo)  # revealed: None | (def foo() -> None)
+    reveal_type(Bar)  # revealed: None | <class 'Bar'>
+
+    def foo() -> None: ...
+
+    class Bar: ...
+```
+
+### Walrus operator assignments are visible via loopback
+
+```py
+def random() -> bool:
+    return False
+
+while random():
+    # error: [possibly-unresolved-reference]
+    reveal_type(y)  # revealed: Literal[1]
+    x = (y := 1)
+```
+
+### Loopback bindings are visible to the walrus operator in the loop condition
+
+```py
+i = 0
+while (i := i + 1) < 1_000_000:
+    reveal_type(i)  # revealed: int
+```
+
+### "Member" (as opposed to "symbol") places are also given loopback bindings
+
+```py
+def random() -> bool:
+    return False
+
+my_dict = {}
+my_dict["x"] = 0
+reveal_type(my_dict["x"])  # revealed: Literal[0]
+while random():
+    my_dict["x"] += 1
+reveal_type(my_dict["x"])  # revealed: int
+```
+
+### `del` prevents bindings from reaching the loopback
+
+This `x` cannot reach the use at the top of the loop:
+
+```py
+def random() -> bool:
+    return False
+
+while random():
+    x  # error: [unresolved-reference]
+    x = 42
+    del x
+```
+
+On the other hand, if `x` is defined before the loop, the `del` makes it a
+`[possibly-unresolved-reference]`:
+
+```py
+x = 0
+while random():
+    x  # error: [possibly-unresolved-reference]
+    x = 42
+    del x
+```
+
+### `del` in a loop makes a variable possibly-unbound after the loop
+
+```py
+def random() -> bool:
+    return False
+
+x = 0
+while random():
+    # error: [possibly-unresolved-reference]
+    del x
+# error: [possibly-unresolved-reference]
+x
+```
+
+### Statically unreachable `del` branches don't poison cyclic loopback
+
+This creates a loop-header cycle through `if x`, but the `del x` branch should still disappear once
+the loopback type settles:
+
+```py
+def random() -> bool:
+    return False
+
+x = 1
+while random():
+    if x:
+        x = 1
+    else:
+        del x
+    reveal_type(x)  # revealed: Literal[1]
+```
+
+Comparison-guarded `del` branches should also disappear once the loopback type settles:
+
+```py
+x = 1
+while x < 10:
+    if x == 4:
+        del x
+    reveal_type(x)  # revealed: Literal[1]
+```
+
+### Deletions in nested loops reach the outer loop
+
+An inner loop can delete a variable on one iteration, then exit through `break` on a later
+iteration. The variable can therefore be unbound both after the inner loop and at the start of the
+next outer iteration.
+
+```py
+def stop() -> bool:
+    raise NotImplementedError
+
+def f(repeat: bool):
+    x = 0
+    while repeat:
+        x  # error: [possibly-unresolved-reference]
+        while True:
+            if stop():
+                break
+            x = 0
+            del x
+        x  # error: [possibly-unresolved-reference]
+```
+
+### Rebinding after an inner loop restores boundness
+
+An inner loop's deletion does not make a variable possibly unbound on later outer iterations if the
+variable is reassigned before reaching the next iteration.
+
+```py
+def stop() -> bool:
+    raise NotImplementedError
+
+def f(repeat: bool):
+    x = 0
+    while repeat:
+        reveal_type(x)  # revealed: Literal[0]
+        while True:
+            if stop():
+                break
+            x = 0
+            del x
+        x = 0
+```
+
+### Statically unreachable deletions in nested loops preserve boundness
+
+A deletion guarded by an impossible comparison does not make the variable possibly unbound, even
+through several nested loops. Evaluating the loop conditions and comparison depends on bindings from
+the enclosing loops.
+
+```py
+def stop() -> bool:
+    raise NotImplementedError
+
+def f(repeat: bool):
+    x = 1
+    while repeat:
+        reveal_type(x)  # revealed: Literal[1]
+        while x:
+            if stop():
+                break
+            while x:
+                if stop():
+                    break
+                if x == 4:
+                    del x
+        reveal_type(x)  # revealed: Literal[1]
+```
+
+### Bindings in a loop are possibly-unbound after the loop
+
+```py
+def random() -> bool:
+    return False
+
+while random():
+    x = 42
+# error: [possibly-unresolved-reference]
+x
+```
+
+### Swap bindings converge normally under fixpoint iteration
+
+```py
+def random() -> bool:
+    return False
+
+x = 1
+y = 2
+while random():
+    x, y = y, x
+    reveal_type(x)  # revealed: Literal[2, 1]
+    reveal_type(y)  # revealed: Literal[1, 2]
+```
+
+### Tuple assignments are inferred correctly
+
+```py
+def random() -> bool:
+    return False
+
+x = 0
+while random():
+    x, y = x + 1, None
+    reveal_type(x)  # revealed: int
+```
+
+### Avoid oscillations
+
+We need to avoid oscillating cycles in cases like the following, where the type of one of these loop
+variables also influences the static reachability of its bindings. This case was minimized from a
+real crash that came up during development checking these lines of `sympy`:
+<https://github.com/sympy/sympy/blob/c2bfd65accf956576b58f0ae57bf5821a0c4ff49/sympy/core/numbers.py#L158-L166>
+
+```py
+def random() -> bool:
+    return False
+
+x = 1
+y = 2
+while random():
+    if x:
+        x, y = y, x
+    reveal_type(x)  # revealed: Literal[2, 1]
+    reveal_type(y)  # revealed: Literal[1, 2]
+```
+
+### Loop increments guarded by chained comparisons converge
+
+A negated comparison chain validates an increment before the loop updates its offset. Inference
+converges even though the guard depends on the value added to the loop variable.
+
+```py
+def advance(data: bytes, offset: int) -> None:
+    while offset < len(data):
+        byte = data[offset]
+        if byte == 0:
+            return
+        step = byte & 15
+        if not 1 <= step <= 8:
+            raise ValueError
+        offset += step
+        # TODO: The offset should retain its `int` type.
+        reveal_type(offset)  # revealed: int | Unknown
+```
+
+### Loop updates guarded by compound conditions converge
+
+Type checks and a negated comparison chain validate a record's size before advancing the offset.
+Combining these checks with `or` preserves the integer type of the updated offset.
+
+```py
+def read_record(offset: int) -> tuple[int | None, int | None]:
+    return 1, 1
+
+def read_records(offset: int, end: int) -> None:
+    while offset < end:
+        value, size = read_record(offset)
+        if not isinstance(value, int) or not isinstance(size, int) or not 0 <= size <= end - offset:
+            raise ValueError
+        offset += size
+        reveal_type(offset)  # revealed: int
+```
+
+### Worklists guarded by chained comparisons converge
+
+A chained comparison guards both extending a worklist and inserting into a set. The set's inferred
+element type remains `str` as entries are added and queued for later loop iterations.
+
+```py
+def visit(start: str, height: int) -> None:
+    columns = "abc"
+    column = columns.index(start[0])
+    row = int(start[1:]) - 1
+    visited = {start}
+    pending = [(column, row)]
+    while pending:
+        current_column, current_row = pending.pop()
+        for x, y in ((current_column, current_row - 1),):
+            if not 0 <= y < height:
+                continue
+            visited.add(f"{columns[x]}{y + 1}")
+            pending.append((x, y))
+            reveal_type(visited)  # revealed: set[str]
+```
+
+### Conditional attribute updates converge
+
+Each batch depends on an instance attribute that is updated from the last item in the batch. The
+condition and the attribute's type depend on each other across loop iterations. Inference converges,
+and the condition narrows the assigned value to a non-empty `str`.
+
+```py
+class Inventory:
+    after: str | None
+
+    def next_batch(self, after: object) -> "list[Inventory]":
+        return []
+
+    def iterate(self):
+        while True:
+            item = None
+            batch = self.next_batch(self.after)
+            assert batch
+            for item in batch:
+                pass
+            if item and item.after:
+                self.after = item.after
+                reveal_type(self.after)  # revealed: str & ~AlwaysFalsy
+```
+
+### Monotonic widening can keep stale loopback bindings reachable
+
+```py
+def random() -> bool:
+    return False
+
+x = 0
+while random():
+    reveal_type(x)  # revealed: Literal[0]
+    if x == 1:
+        x = 2
+```
+
+### Conditional unpacking and loop exits converge normally
+
+This reduced example from issue #3057 used to panic with "too many cycle iterations":
+
+```py
+def fetch(req) -> tuple:  # error: [missing-type-argument]
+    return (True, None)
+
+def paginate():
+    bookmark = None
+    while True:
+        if bookmark is None:
+            req = None
+        else:
+            req = bookmark
+        ok, next_bookmark = fetch(req)
+        if not ok:
+            return
+        bookmark = next_bookmark
+        if bookmark is None or bookmark == 0:
+            break
+```
+
+### Loop bodies that are guaranteed to execute at least once
+
+TODO: We should be able to see when a loop body is guaranteed to execute at least once. However,
+Pyright and other checkers don't currently handle this case either.
+
+```py
+x = "foo"
+while x != "bar":
+    definitely_bound = 42
+    x = "bar"
+# TODO: We should see that `definitely_bound` is definitely bound.
+# error: [possibly-unresolved-reference]
+reveal_type(definitely_bound)  # revealed: Literal[42]
+```
+
+### Bindings in statically unreachable branches are excluded from loopback
+
+```py
+VAL = 1
+
+x = 1
+while True:
+    reveal_type(x)  # revealed: Literal[1]
+    if VAL - 1:
+        x = 2
+```
+
+### `Divergent` in narrowing conditions doesn't run afoul of "monotonic widening" in cycle recovery
+
+The following is a deceptively-simple-looking case of narrowing that was difficult to get right in
+the initial implementation of cyclic control flow. We start with a non-empty linked list, and we
+advance it in a loop until there's exactly one node left:
+
+```py
+class Node:
+    def __init__(self, next: "Node | None" = None):
+        self.next: "Node | None" = next
+
+node = Node(Node(Node()))
+while node.next is not None:
+    node = node.next
+reveal_type(node)  # revealed: Node
+reveal_type(node.next)  # revealed: None
+```
+
+There's nothing wrong with this code, and it was minimized from [real cases] in the ecosystem. But
+it's prone to false-positive `[possibly-missing-attribute]` warnings on the `node.next` accesses if
+we lose track of the fact that the `node` variable is never `None`. Note that the loop condition
+narrows `node.next`, not `node` itself, so that constraint needs to flow through the assignment in
+the loop body, and through the loop header definition that sees that assignment, to the prior uses
+of `node` in the loop condition and in the RHS of the assignment. We expect that to become a Salsa
+cycle that we resolve through fixpoint iteration. That runs into two of our cycle recovery
+behaviors:
+
+1. When cycles show up in a standalone expression definition (in this case, the `while` loop
+    condition), the `cycle_initial` value (`expression_cycle_initial`) is an empty map with a
+    "fallback type" that reports `Divergent` for _every_ sub-expression. That even includes literal
+    expressions like `42` and (in this case) `None`.
+1. To avoid oscillations in cycle recovery (`Type::cycle_normalized`), we union together the type
+    inferred in the previous iteration with the type inferred in the current one, as long as
+    neither of them contains `Divergent`. In other words, we do "monotonic widening".
+
+The interaction we have to worry about is getting stuck with a type that's too wide. When we try to
+do narrowing in the first cycle iteration, `is not None` behaves like `is not Divergent`. If the
+consequence is that we don't do any narrowing at all, then for that iteration we'll end up inferring
+`Node | None` for `node`. (For completeness, we actually infer `Node | None | Divergent` because of
+a nested cycle, but we strip out _that_ `Divergent` in another part of cycle recovery. The
+[full chain of events here][divergent_debugging] is quite long.) In the second cycle iteration we'll
+get the narrowing right and infer that `node` is of type `Node`, but then our monotonic widening
+step will union `Node` with `Node | None` from the previous iteration, reproduce the same wrong
+answer, and declare that to be the fixpoint. Finally we get false-positive warnings from the fact
+that `None` doesn't have a `.next` field.
+
+So, because we do monotonic widening in cycle recovery, we need to make sure that temporarily
+`Divergent` expressions in narrowing constraints don't lead to too-wide-but-not-visibly-`Divergent`
+types. Instead, `Divergent` should "poison" any value we try to narrow against it, so that our cycle
+recovery logic doesn't carry that result forward.
+
+Addendum: #23563 fixed the implementation of `Type::cycle_normalized`, so that such "tainted
+previous values" are no longer unioned.
+
+### `global` and `nonlocal` keywords in a loop
+
+We need to make sure that the loop header definition doesn't count as a "use" prior to the
+`global`/`nonlocal` declaration, or else we'll emit a false-positive semantic syntax error:
+
+```py
+x = 0
+
+def _():
+    y = 0
+    def _():
+        while True:
+            global x
+            nonlocal y
+            x = 42
+            y = 99
+```
+
+On the other hand, we don't want to shadow true positives:
+
+```py
+x = 0
+
+def _():
+    y = 0
+    def _():
+        x = 1
+        y = 1
+        while True:
+            global x  # error: [invalid-syntax] "name `x` is used prior to global declaration"
+            nonlocal y  # error: [invalid-syntax] "name `y` is used prior to nonlocal declaration"
+```
+
+### Use with loop header and also `UNBOUND` definitely visible
+
+In `place_from_bindings_impl` we usually assert that if at least one (non-`UNBOUND`) binding is
+visible, then `UNBOUND` should not be definitely-visible. That makes intuitive sense: either a
+binding should shadow `UNBOUND` entirely, or if it was made in a branch then it should attach the
+negated branch condition to `UNBOUND`. However, loop header bindings are an exception to this rule,
+because they don't shadow prior bindings. In this example `UNBOUND` is definitely-visible, and we
+need to avoid panicking:
+
+```py
+while True:
+    x  # error: [possibly-unresolved-reference]
+    x = 1
+```
+
+### Rebinding an object before an unconditional `break`
+
+Rebinding an object followed by an unconditional `break` does not affect its members at the start of
+the loop, because the new object never reaches another iteration.
+
+```py
+class C:
+    x = None
+
+c = C()
+c.x = 0
+
+while True:
+    reveal_type(c.x)  # revealed: Literal[0]
+    c = C()
+    break
+
+d = [0]
+d[0] = 1
+
+while True:
+    reveal_type(d[0])  # revealed: Literal[1]
+    d = []
+    break
+```
+
+The same applies to narrowing from a guard before the loop. The condition is always true on the only
+iteration, but the replacement object's attribute is not narrowed after the `break`.
+
+```py
+class Box:
+    value: bool
+
+def f(box: Box):
+    if box.value:
+        return
+
+    while reveal_type(not box.value):  # revealed: Literal[True]
+        box = Box()
+        break
+
+    reveal_type(box.value)  # revealed: bool
+```
+
+### Rebinding an object resets attribute narrowing across iterations
+
+The first iteration sees the initial object's `int` value; later iterations see the replacement's
+`str` value. The type at the start of the body is therefore `int | str`. Rebinding restores the full
+declared attribute type, including `None`, until the replacement is narrowed again.
+
+```py
+class Box:
+    value: int | str | None
+
+def example(box: Box):
+    assert isinstance(box.value, int)
+    reveal_type(box.value)  # revealed: int
+
+    while True:
+        reveal_type(box.value)  # revealed: int | str
+
+        box = Box()
+        reveal_type(box.value)  # revealed: int | str | None
+
+        assert isinstance(box.value, str)
+```
+
+### Rebinding an object affects the loop condition
+
+A guard before the loop only constrains the initial object. Rebinding `box` can make `box.value`
+true on a later iteration, so the loop condition is not always true.
+
+```py
+class Box:
+    value: bool
+
+def condition(box: Box, replacement: Box):
+    if box.value:
+        return
+
+    reveal_type(box.value)  # revealed: Literal[False]
+
+    while reveal_type(not box.value):  # revealed: bool
+        box = replacement
+```
+
+When the loop exits normally, `box.value` is `True`.
+
+```py
+def normal_exit(box: Box, replacement: Box):
+    if box.value:
+        return
+
+    reveal_type(box.value)  # revealed: Literal[False]
+
+    while not box.value:
+        reveal_type(box.value)  # revealed: Literal[False]
+        box = replacement
+        reveal_type(box.value)  # revealed: bool
+
+    reveal_type(box.value)  # revealed: Literal[True]
+```
+
+### Rebinding an object before `continue`
+
+Rebinding also invalidates attribute narrowing when the next iteration is reached through
+`continue`. A replacement whose `value` is `True` can end the loop.
+
+```py
+class Box:
+    value: bool
+
+def f(box: Box, replacement: Box):
+    if box.value:
+        return
+
+    while not box.value:
+        box = replacement
+        continue
+
+    reveal_type(box.value)  # revealed: Literal[True]
+```
+
+### Rebinding in an inner loop reaches the next outer iteration
+
+An inner loop can rebind `box` on one iteration, then exit through a `break` before reaching the
+assignment again. The replacement is visible both after the inner loop and on later outer
+iterations, so the initial guard no longer narrows `box.value`.
+
+```py
+class Box:
+    value: bool
+
+def stop() -> bool:
+    raise NotImplementedError
+
+def f(box: Box, replacement: Box, repeat: bool):
+    if box.value:
+        return
+
+    while repeat:
+        reveal_type(box.value)  # revealed: bool
+        while True:
+            if stop():
+                break
+            box = replacement
+        reveal_type(box.value)  # revealed: bool
+```
+
+### Rebinding a member resets nested attribute narrowing
+
+Replacing `wrapper.box` invalidates narrowing of `wrapper.box.value` on subsequent iterations, even
+though the outer `wrapper` object is unchanged.
+
+```py
+class Box:
+    value: bool
+
+class Wrapper:
+    box: Box
+
+def f(wrapper: Wrapper, replacement: Box):
+    if wrapper.box.value:
+        return
+
+    while not wrapper.box.value:
+        wrapper.box = replacement
+
+    reveal_type(wrapper.box.value)  # revealed: Literal[True]
+```
+
+### Rebinding a collection resets subscript narrowing
+
+A guard on the initial tuple's element does not constrain the corresponding element of a replacement
+tuple. The replacement can therefore end the loop.
+
+```py
+def f(flags: tuple[bool], replacement: tuple[bool]):
+    if flags[0]:
+        return
+
+    while not flags[0]:
+        flags = replacement
+
+    reveal_type(flags[0])  # revealed: Literal[True]
+```
+
+[divergent_debugging]: https://github.com/astral-sh/ruff/pull/22794#issuecomment-3852095578
+[real cases]: https://github.com/Finistere/antidote/blob/7d64ff76b7e283e5d9593ca09ea7a52b9b054957/src/antidote/_internal/localns.py#L34-L35

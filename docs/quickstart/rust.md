@@ -345,3 +345,10 @@ assert_eq!(result, MontyObject::int(42));
 - [`FunctionCall::object_id`](../api/rust/monty.md#functioncall) and [`NameLookup::object_id`](../api/rust/monty.md#namelookup)
     identify the host receiver for routed calls and lookups, including class construction via `__call__`.
     Plain calls and lookups carry `None`.
+
+## Static analysis in the development fork
+
+`monty_analysis::analyze` is a synchronous, in-process Rust API.
+It checks source and optionally exports owned expression type graphs without executing Python.
+It does not use a pool, worker binary or protocol messages.
+See the monty-analysis crate README for the request and result contracts.

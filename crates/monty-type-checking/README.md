@@ -64,3 +64,9 @@ need their own.
 - [`monty-type-checking`](https://crates.io/crates/monty-type-checking) — type checking of sandboxed code, powered by [ty](https://docs.astral.sh/ty/). **this crate**
 - [`monty-typeshed`](https://crates.io/crates/monty-typeshed) — the trimmed typeshed stubs describing the stdlib subset Monty implements.
 - [`monty-macros`](https://crates.io/crates/monty-macros) — the proc macros behind `monty`'s argument parsing.
+
+
+The development fork's `monty-analysis` sibling uses a scoped `inspect` hook
+that returns owned results while retaining this crate's in-memory source and
+checker lifecycle. Consumers needing inferred type graphs should use that crate;
+the low-level hook exposes checker internals and is not a stable public contract.

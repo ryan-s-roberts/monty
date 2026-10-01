@@ -67,6 +67,7 @@ export interface ClassTypeNode {
   id: string
   hostDefined: boolean
   isDataclass: boolean
+  recordAccess: boolean
   attrs: Array<NodePair>
 }
 export interface ClassInstanceNode {

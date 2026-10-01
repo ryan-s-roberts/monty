@@ -835,3 +835,39 @@ fn invalid_is_keyword() {
     assert_eq!(err.exc_type(), ExcType::SyntaxError);
     assert_eq!(err.message(), Some("Input name 'async' not a valid identifier"));
 }
+
+#[test]
+fn host_record_indexing_is_explicit_and_uses_eager_fields() {
+    for (record, source, expected) in [
+        (true, "x['n'] + x.n", Some(MontyObject::int(14))),
+        (true, "x['missing']", None),
+        (true, "x[1]", None),
+        (false, "x['n']", None),
+    ] {
+        let ty = if record {
+            MontyObject::record_type("Record", MontyUuid::from_u128(91))
+        } else {
+            MontyObject::class_type("Ordinary", MontyUuid::from_u128(92), true, false, [])
+        };
+        let input = MontyObject::class_instance(
+            ty,
+            MontyUuid::from_u128(93),
+            [(MontyObject::string("n"), MontyObject::int(7))],
+        );
+        let mut run = MontyRun::new(source.into(), "record.py", vec!["x".into()], CompileOptions::default()).unwrap();
+        let result = run.run_no_limits(vec![input]);
+        if let Some(expected) = expected {
+            assert_eq!(result.unwrap(), expected);
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.exc_type(),
+                if record && source == "x['missing']" {
+                    ExcType::KeyError
+                } else {
+                    ExcType::TypeError
+                }
+            );
+        }
+    }
+}

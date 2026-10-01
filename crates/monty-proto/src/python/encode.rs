@@ -496,6 +496,7 @@ impl<'py> ClassTypeSource<'py> {
                 id: wrapper_uuid(wrapper, "ClassType")?,
                 host_defined: true,
                 is_dataclass: wrapper.call_method0(intern!(py, "is_dataclass"))?.extract()?,
+                record_access: false,
             },
             attrs,
             identity: Some(wrapper.clone()),
@@ -515,6 +516,7 @@ impl<'py> ClassTypeSource<'py> {
             id: class_type.id,
             host_defined: class_type.host_defined,
             is_dataclass: class_type.is_dataclass,
+            record_access: class_type.record_access,
             attrs,
         }))
     }

@@ -1,6 +1,9 @@
 use std::{fmt, io::ErrorKind, mem};
 
-use monty_types::{TypeCheckingConfig, TypeCheckingFormat};
+use monty_types::{
+    TypeCheckingConfig, TypeCheckingFormat,
+    analysis::{AnalysisDiagnostic, Span as AnalysisSpan},
+};
 use ruff_db::{
     Db as _,
     diagnostic::{
@@ -58,6 +61,16 @@ impl TypeChecker {
         stubs_file: Option<&SourceFile<'_>>,
         config: TypeCheckingConfig,
     ) -> Result<Option<TypeCheckingDiagnostics<'a>>, String> {
+        self.run_checked(python_source, stubs_file, config, false)
+    }
+
+    fn run_checked<'a>(
+        &'a mut self,
+        python_source: &SourceFile<'_>,
+        stubs_file: Option<&SourceFile<'_>>,
+        config: TypeCheckingConfig,
+        errors_only: bool,
+    ) -> Result<Option<TypeCheckingDiagnostics<'a>>, String> {
         let src_root = SystemPathBuf::from(SRC_ROOT);
         let main_path = src_root.join(python_source.path);
         let main_source = python_source.source_code;
@@ -88,7 +101,14 @@ impl TypeChecker {
         // (e.g. deeply nested parentheses that ruff's parser rejects) would silently
         // type-check clean.
         let mut diagnostics = check_file_unwrap(&self.db, self.db.program_file(main_file));
-        diagnostics.retain(filter_diagnostics);
+        diagnostics.retain(|d| {
+            filter_diagnostics(d)
+                && (!errors_only
+                    || matches!(
+                        d.severity(),
+                        ruff_db::diagnostic::Severity::Error | ruff_db::diagnostic::Severity::Fatal
+                    ))
+        });
 
         if diagnostics.is_empty() {
             Ok(None)
@@ -123,6 +143,47 @@ impl TypeChecker {
                 config,
             }))
         }
+    }
+
+    /// Inspect checked source with database-borrowed handles confined to the callback.
+    /// The callback must return owned data; callers own reset/isolation policy.
+    #[doc(hidden)]
+    pub fn inspect<R>(
+        &mut self,
+        source: &SourceFile<'_>,
+        stubs: Option<&SourceFile<'_>>,
+        inspect: impl for<'db> FnOnce(&'db dyn ty_python_semantic::Db, File, u32) -> R,
+    ) -> Result<Result<R, Vec<AnalysisDiagnostic>>, String> {
+        if let Some(diagnostics) = self.run_checked(source, stubs, TypeCheckingConfig::default(), true)? {
+            let owned = diagnostics
+                .diagnostics
+                .iter()
+                .map(|d| {
+                    let primary = d.primary_span();
+                    AnalysisDiagnostic {
+                        code: d.id().to_string(),
+                        message: d.headline_message().to_string(),
+                        source: primary.as_ref().map(|s| match s.file() {
+                            UnifiedFile::Ty(file) => file.path(&diagnostics.type_checker.db).to_string(),
+                            UnifiedFile::Ruff(file) => file.name().to_string(),
+                        }),
+                        span: primary.and_then(|s| s.range()).map(|r| AnalysisSpan {
+                            start: r.start().to_u32(),
+                            end: r.end().to_u32(),
+                        }),
+                    }
+                })
+                .collect();
+            return Ok(Err(owned));
+        }
+        let offset = stubs.map_or(0, |stub| {
+            let stem = stub.path.split_once('.').map_or(stub.path, |(stem, _)| stem);
+            // run has already checked this length fits u32.
+            u32::try_from(format!("from {stem} import *\n").len()).expect("checked import length")
+        });
+        let path = SystemPathBuf::from(SRC_ROOT).join(source.path);
+        let file = system_path_to_file(&self.db, &path).map_err(to_string)?;
+        Ok(Ok(inspect(&self.db, file, offset)))
     }
 
     /// Write one root file into the db and remember it for mandatory cleanup.

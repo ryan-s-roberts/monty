@@ -366,6 +366,7 @@ export class MontyClassProxy {
   readonly name: string
   /** Whether the instance was a dataclass on the side that produced it. */
   readonly isDataclass: boolean
+  readonly recordAccess: boolean
   /** Identity of the instance (canonical uuid string): the id the sandbox
    *  resolves the original object by when the proxy is passed back. */
   readonly id: string
@@ -379,6 +380,7 @@ export class MontyClassProxy {
   constructor(classType: Record<string, unknown>, id: string, attrs: Array<[string, unknown]>) {
     this.name = typeof classType.name === 'string' ? classType.name : 'object'
     this.isDataclass = classType.isDataclass === true
+    this.recordAccess = classType.recordAccess === true
     this.id = id
     this.classType = classType
     const attributes: Record<string, unknown> = Object.create(null)
@@ -729,6 +731,7 @@ function openClassTypeObject(ref: ClassTypeRef, store: InstanceStore, memo: Walk
     hostDefined: true,
     // JS has no dataclasses; host-wrapped objects always cross as plain classes
     isDataclass: false,
+    recordAccess: false,
   }
   if (seen === IN_PROGRESS) {
     return { ...header, attrs: [] }
