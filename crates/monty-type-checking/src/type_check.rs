@@ -162,7 +162,19 @@ impl TypeChecker {
                     let primary = d.primary_span();
                     AnalysisDiagnostic {
                         code: d.id().to_string(),
-                        message: d.headline_message().to_string(),
+                        message: {
+                            // Preserve checker evidence such as operand types;
+                            // the headline alone can imply an operator is absent.
+                            let mut parts = vec![d.headline_message().to_string()];
+                            for annotation in d.annotations() {
+                                if let Some(message) = annotation.get_message() {
+                                    if !parts.iter().any(|part| part == message) {
+                                        parts.push(message.to_owned());
+                                    }
+                                }
+                            }
+                            parts.join("; ")
+                        },
                         source: primary.as_ref().map(|s| match s.file() {
                             UnifiedFile::Ty(file) => file.path(&diagnostics.type_checker.db).to_string(),
                             UnifiedFile::Ruff(file) => file.name().to_string(),
@@ -184,6 +196,24 @@ impl TypeChecker {
         let path = SystemPathBuf::from(SRC_ROOT).join(source.path);
         let file = system_path_to_file(&self.db, &path).map_err(to_string)?;
         Ok(Ok(inspect(&self.db, file, offset)))
+    }
+
+    /// Inspect the upstream semantic index without requesting type admission.
+    /// This is for lexical facts in host languages with unresolved host calls;
+    /// it is not evidence that the program is well typed or executable.
+    #[doc(hidden)]
+    pub fn inspect_syntax<R>(
+        &mut self,
+        source: &SourceFile<'_>,
+        inspect: impl for<'db> FnOnce(&'db dyn ty_python_semantic::Db, File) -> R,
+    ) -> Result<R, String> {
+        let path = SystemPathBuf::from(SRC_ROOT).join(source.path);
+        let file = self.write_root_file(&path, source.source_code)?;
+        let parsed = ruff_db::parsed::parsed_module(&self.db, self.db.program_file(file).python_file(&self.db));
+        if !parsed.load(&self.db).errors().is_empty() {
+            return Err("invalid Python syntax in lexical analysis".into());
+        }
+        Ok(inspect(&self.db, file))
     }
 
     /// Write one root file into the db and remember it for mandatory cleanup.

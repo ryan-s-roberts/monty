@@ -8,9 +8,10 @@ pub(crate) fn convert(graph: ty::Graph, offset: u32) -> Graph {
     };
     for node in &mut graph.nodes {
         let identity = match node {
-            Node::Instance { identity, .. } | Node::NewType { identity, .. } | Node::EnumLiteral { identity, .. } => {
-                Some(identity)
-            }
+            Node::Protocol { identity, .. }
+            | Node::Instance { identity, .. }
+            | Node::NewType { identity, .. }
+            | Node::EnumLiteral { identity, .. } => Some(identity),
             Node::Record { identity, .. } => identity.as_mut(),
             _ => None,
         };
@@ -52,6 +53,13 @@ fn node(node: ty::Node) -> Node {
             identity: id,
             arguments,
         } => Node::Instance {
+            identity: identity(id),
+            arguments: ids(arguments),
+        },
+        ty::Node::Protocol {
+            identity: id,
+            arguments,
+        } => Node::Protocol {
             identity: identity(id),
             arguments: ids(arguments),
         },

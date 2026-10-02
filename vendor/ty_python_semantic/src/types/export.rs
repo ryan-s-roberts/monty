@@ -59,6 +59,10 @@ pub enum Node {
         identity: Identity,
         arguments: Vec<TypeId>,
     },
+    Protocol {
+        identity: Identity,
+        arguments: Vec<TypeId>,
+    },
     Tuple {
         prefix: Vec<TypeId>,
         variable: Option<TypeId>,
@@ -222,6 +226,22 @@ impl<'db> Builder<'_, 'db> {
                     }
                 }
             }
+            Type::ProtocolInstance(protocol) => {
+                if protocol.materialization_kind(db).is_some() {
+                    return Ok(Node::Unsupported);
+                }
+                let Some(origin) = protocol.class_origin(db) else {
+                    return Ok(Node::Unsupported);
+                };
+                let (class, spec) = origin.class_literal_and_specialization(db);
+                Node::Protocol {
+                    identity: self.identity(class),
+                    arguments: match spec {
+                        Some(spec) => self.ids(spec.types(db))?,
+                        None => Vec::new(),
+                    },
+                }
+            }
             Type::TypedDict(record) => {
                 let identity = match record {
                     TypedDictType::Class(class) => Some(self.identity(class.class_literal(db))),
@@ -264,5 +284,302 @@ impl<'db> Builder<'_, 'db> {
             }
             _ => Node::Unsupported,
         })
+    }
+}
+
+/// Export the checker types of a function's returns, including implicit None.
+/// This is a query over existing inference and reachability, not a second checker.
+pub fn function_returns(
+    db: &dyn Db,
+    file: ruff_db::files::File,
+    function: &ruff_python_ast::StmtFunctionDef,
+    limit: u32,
+) -> Result<Graph, ExportLimitExceeded> {
+    use crate::{HasType, SemanticModel, reachability::ReachabilityConstraintsExtension};
+    use ruff_python_ast::{
+        Stmt,
+        visitor::{self, Visitor},
+    };
+    use ty_python_core::{scope::NodeWithScopeRef, semantic_index};
+    #[derive(Default)]
+    struct Returns<'a> {
+        values: Vec<&'a ruff_python_ast::StmtReturn>,
+        depth: usize,
+        exceeded: bool,
+    }
+    impl<'a> Visitor<'a> for Returns<'a> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if self.depth >= 128 {
+                self.exceeded = true;
+                return;
+            }
+            self.depth += 1;
+            match stmt {
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+                Stmt::Return(ret) => self.values.push(ret),
+                _ => visitor::walk_stmt(self, stmt),
+            }
+            self.depth -= 1;
+        }
+    }
+    let program_file = db.program_file(file);
+    let env = ProgramEnvironment::from_file(program_file);
+    let model = SemanticModel::new(db, program_file);
+    let index = semantic_index(db, program_file);
+    let scope = index.node_scope(NodeWithScopeRef::Function(function));
+    if scope.is_generator_function(&index) {
+        return Ok(Graph {
+            roots: vec![TypeId(0)],
+            nodes: vec![Node::Unsupported],
+        });
+    }
+    let use_def = index.use_def_map(scope);
+    let implicit_none = !use_def
+        .reachability_constraints()
+        .evaluate(db, use_def.predicates(), use_def.end_of_scope_reachability())
+        .is_always_false();
+    let mut returns = Returns::default();
+    returns.visit_body(&function.body);
+    if returns.exceeded || returns.values.len() > 1024 {
+        return Err(ExportLimitExceeded);
+    }
+    let mut types = returns
+        .values
+        .into_iter()
+        .filter(|ret| crate::reachability::is_range_reachable(db, &index, scope, ret.range()))
+        .map(|ret| match ret.value.as_deref() {
+            Some(expr) => expr.inferred_type(&model).unwrap_or(Type::unknown()),
+            None => Type::none(db, &env),
+        })
+        .collect::<Vec<_>>();
+    if implicit_none {
+        types.push(Type::none(db, &env));
+    }
+    if types.is_empty() {
+        types.push(Type::Never);
+    }
+    export(db, &env, &types, limit)
+}
+
+/// Export actual Python lexical bindings, including bindings in loops, patterns,
+/// annotations and nested definitions, without reconstructing binding syntax.
+pub fn function_locals(
+    db: &dyn Db,
+    file: ruff_db::files::File,
+    function: &ruff_python_ast::StmtFunctionDef,
+) -> Vec<String> {
+    use ty_python_core::{scope::NodeWithScopeRef, semantic_index};
+    let index = semantic_index(db, db.program_file(file));
+    let scope = index.node_scope(NodeWithScopeRef::Function(function));
+    index
+        .place_table(scope)
+        .symbols()
+        .filter(|symbol| symbol.is_local())
+        .map(|symbol| symbol.name().to_string())
+        .collect()
+}
+
+/// Unbound lexical loads in an expression unit. Builtins remain external: the
+/// embedding chooses which external identities denote its own dependencies.
+pub fn external_names(db: &dyn Db, file: ruff_db::files::File) -> Result<Vec<(u32, u32, String)>, ExportLimitExceeded> {
+    use crate::SemanticModel;
+    use ruff_python_ast::{
+        Expr,
+        visitor::{self, Visitor},
+    };
+    use ty_python_core::semantic_index;
+    struct Loads<'a> {
+        names: Vec<&'a ruff_python_ast::ExprName>,
+        depth: usize,
+        exceeded: bool,
+    }
+    impl<'a> Visitor<'a> for Loads<'a> {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if self.depth >= 128 {
+                self.exceeded = true;
+                return;
+            }
+            if let Expr::Name(name) = expr {
+                if name.ctx == ruff_python_ast::ExprContext::Load {
+                    self.names.push(name);
+                }
+            }
+            self.depth += 1;
+            visitor::walk_expr(self, expr);
+            self.depth -= 1;
+        }
+    }
+    let file = db.program_file(file);
+    let parsed = parsed_module(db, file.python_file(db)).load(db);
+    let model = SemanticModel::new(db, file);
+    let index = semantic_index(db, file);
+    let mut loads = Loads {
+        names: vec![],
+        depth: 0,
+        exceeded: false,
+    };
+    loads.visit_body(parsed.suite());
+    if loads.exceeded {
+        return Err(ExportLimitExceeded);
+    }
+    Ok(loads
+        .names
+        .into_iter()
+        .filter(|name| {
+            !model.scope((*name).into()).is_some_and(|scope| {
+                index.visible_ancestor_scopes(scope).any(|(scope, _)| {
+                    index
+                        .place_table(scope)
+                        .symbol_by_name(name.id.as_str())
+                        .is_some_and(|symbol| symbol.is_local())
+                })
+            })
+        })
+        .map(|name| (name.start().to_u32(), name.end().to_u32(), name.id.to_string()))
+        .collect())
+}
+
+/// An explicit argument's parameter, obtained from the Python call binder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgumentBinding {
+    pub parameter: String,
+    pub variadic: bool,
+}
+
+pub fn bind_one_positional(
+    db: &dyn Db,
+    file: ruff_db::files::File,
+    function: &ruff_python_ast::StmtFunctionDef,
+) -> Result<ArgumentBinding, String> {
+    let bindings = bind_arguments(db, file, function, &[None])?;
+    bindings
+        .into_iter()
+        .next()
+        .ok_or_else(|| "missing positional binding".into())
+}
+
+/// Bind explicit positional and named arguments in source evaluation order.
+/// `None` denotes a positional argument; `Some` denotes a keyword.
+pub fn bind_arguments(
+    db: &dyn Db,
+    file: ruff_db::files::File,
+    function: &ruff_python_ast::StmtFunctionDef,
+    arguments: &[Option<String>],
+) -> Result<Vec<ArgumentBinding>, String> {
+    use super::call::{Argument, CallArguments};
+    use super::signatures::ParameterKind;
+    use crate::{HasType, SemanticModel};
+    let program_file = db.program_file(file);
+    let model = SemanticModel::new(db, program_file);
+    let env = ProgramEnvironment::from_file(program_file);
+    let callable = function.inferred_type(&model).ok_or("missing callable type")?;
+    let args: CallArguments = arguments
+        .iter()
+        .map(|name| {
+            (
+                name.as_deref().map_or(Argument::Positional, Argument::Keyword),
+                Some(Type::unknown()),
+            )
+        })
+        .collect();
+    let bindings = callable.bindings(db, &env).match_parameters(db, &env, &args);
+    let mut matches = bindings.iter_flat().flat_map(|b| b.matching_overloads());
+    let (_, binding) = matches
+        .next()
+        .ok_or("Python arguments do not match the callable signature")?;
+    if matches.next().is_some() {
+        return Err("ambiguous Python call binding".into());
+    }
+    if !binding.errors().is_empty() {
+        return Err(format!("Python call binding: {:?}", binding.errors()));
+    }
+    binding
+        .argument_matches()
+        .iter()
+        .map(|argument| {
+            let [matched] = argument.parameters.as_slice() else {
+                return Err("ambiguous argument binding".into());
+            };
+            let parameter = &binding.signature.parameters()[matched.index];
+            Ok(ArgumentBinding {
+                parameter: parameter.name().ok_or("unnamed parameter")?.to_string(),
+                variadic: matches!(
+                    parameter.kind(),
+                    ParameterKind::Variadic { .. } | ParameterKind::KeywordVariadic { .. }
+                ),
+            })
+        })
+        .collect()
+}
+
+/// Reachability is read from the semantic index; the embedding never decides
+/// whether a Python statement or function fallthrough is reachable.
+pub fn reachable_statements(
+    db: &dyn Db,
+    file: ruff_db::files::File,
+    function: &ruff_python_ast::StmtFunctionDef,
+) -> Result<(Vec<(u32, u32)>, bool), ExportLimitExceeded> {
+    use crate::reachability::ReachabilityConstraintsExtension;
+    use ruff_python_ast::{
+        Stmt,
+        visitor::{self, Visitor},
+    };
+    use ty_python_core::{scope::NodeWithScopeRef, semantic_index};
+    struct Statements<'a> {
+        values: Vec<&'a Stmt>,
+        depth: usize,
+        exceeded: bool,
+    }
+    impl<'a> Visitor<'a> for Statements<'a> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if self.depth >= 128 || self.values.len() >= 4096 {
+                self.exceeded = true;
+                return;
+            }
+            self.values.push(stmt);
+            if !matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                self.depth += 1;
+                visitor::walk_stmt(self, stmt);
+                self.depth -= 1;
+            }
+        }
+    }
+    let index = semantic_index(db, db.program_file(file));
+    let scope = index.node_scope(NodeWithScopeRef::Function(function));
+    let mut statements = Statements {
+        values: vec![],
+        depth: 0,
+        exceeded: false,
+    };
+    statements.visit_body(&function.body);
+    if statements.exceeded {
+        return Err(ExportLimitExceeded);
+    }
+    let ranges = statements
+        .values
+        .into_iter()
+        .filter(|s| crate::reachability::is_range_reachable(db, &index, scope, s.range()))
+        .map(|s| (s.start().to_u32(), s.end().to_u32()))
+        .collect();
+    let use_def = index.use_def_map(scope);
+    let fallthrough = !use_def
+        .reachability_constraints()
+        .evaluate(db, use_def.predicates(), use_def.end_of_scope_reachability())
+        .is_always_false();
+    Ok((ranges, fallthrough))
+}
+
+/// Definite truth of a condition, if established by the upstream checker.
+pub fn condition_truth(db: &dyn Db, file: ruff_db::files::File, expression: &ruff_python_ast::Expr) -> Option<bool> {
+    use crate::{HasType, SemanticModel};
+    let file = db.program_file(file);
+    let model = SemanticModel::new(db, file);
+    match expression
+        .inferred_type(&model)?
+        .bool(db, &ProgramEnvironment::from_file(file))
+    {
+        ty_python_core::Truthiness::AlwaysTrue => Some(true),
+        ty_python_core::Truthiness::AlwaysFalse => Some(false),
+        ty_python_core::Truthiness::Ambiguous => None,
     }
 }

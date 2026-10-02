@@ -44,6 +44,14 @@ mod stringize;
 pub fn expression_source(expression: &ruff_python_ast::Expr) -> String {
     stringize::stringize_annotation(&mut expression.clone())
 }
+/// Render a statement AST without evaluating it.
+pub fn statement_source(statement: &ruff_python_ast::Stmt) -> String {
+    ruff_python_codegen::Generator::new(
+        &ruff_python_codegen::Indentation::default(),
+        ruff_source_file::LineEnding::Lf,
+    )
+    .stmt(statement)
+}
 mod types;
 mod value;
 mod virtual_path;

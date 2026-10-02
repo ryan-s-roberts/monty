@@ -102,6 +102,10 @@ pub enum Node {
         identity: Identity,
         arguments: Vec<TypeId>,
     },
+    Protocol {
+        identity: Identity,
+        arguments: Vec<TypeId>,
+    },
     Tuple {
         prefix: Vec<TypeId>,
         variable: Option<TypeId>,
