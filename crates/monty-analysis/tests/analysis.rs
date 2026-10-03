@@ -139,6 +139,34 @@ fn any_unknown_and_unsupported_remain_distinct() {
 }
 
 #[test]
+fn nested_function_span_exports_its_checked_body_return() {
+    let source = "def outer(xs: list[int]):\n    def doubled(items: list[int]):\n        return [x * 2 for x in items]\n    return doubled(xs)\n";
+    let nested = "def doubled(items: list[int]):\n        return [x * 2 for x in items]";
+    let start = u32::try_from(source.find(nested).unwrap()).unwrap();
+    let result = monty_analysis::analyze_function_at(
+        &AnalysisRequest {
+            source: source.into(),
+            stubs: Some("marker: int".into()),
+            targets: vec![],
+            limits: AnalysisLimits::default(),
+        },
+        Span {
+            start,
+            end: start + u32::try_from(nested.len()).unwrap(),
+        },
+    )
+    .unwrap();
+    let AnalysisOutcome::Inferred(graph) = result.outcome else {
+        panic!("{result:?}")
+    };
+    assert!(!graph.nodes.contains(&Node::Unknown), "{graph:?}");
+    assert!(
+        matches!(root(&graph), Node::Instance { identity, .. } if identity.path.last().unwrap() == "list"),
+        "{graph:?}"
+    );
+}
+
+#[test]
 fn limits_and_nonexpression_targets_fail_without_partial_success() {
     let mut req = request("(1, 2)", "(1, 2)", None);
     req.limits.max_type_references = 1;

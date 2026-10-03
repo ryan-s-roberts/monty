@@ -134,6 +134,27 @@ impl<'ast> Visitor<'ast> for Selector<'_, 'ast> {
 /// Analyze a named top-level function's complete return boundary. Python's
 /// checker owns local flow, container inference and implicit-return reachability.
 pub fn analyze_function(request: &AnalysisRequest, name: &str) -> Result<AnalysisResult, String> {
+    analyze_selected_function(request, FunctionSelector::TopLevelName(name))
+}
+
+/// Analyze a function at its original source span, including a lexically nested helper.
+/// The checker still owns body flow and return types; the span only selects its AST node.
+pub fn analyze_function_at(request: &AnalysisRequest, span: Span) -> Result<AnalysisResult, String> {
+    if span.start >= span.end || request.source.get(span.start as usize..span.end as usize).is_none() {
+        return Err("analysis function span is not a valid nonempty UTF-8 source range".into());
+    }
+    analyze_selected_function(request, FunctionSelector::Span(span))
+}
+
+enum FunctionSelector<'a> {
+    TopLevelName(&'a str),
+    Span(Span),
+}
+
+fn analyze_selected_function(
+    request: &AnalysisRequest,
+    selector: FunctionSelector<'_>,
+) -> Result<AnalysisResult, String> {
     validate(request)?;
     let mut checker = TypeChecker::default();
     let source = SourceFile::new(&request.source, "analysis.py");
@@ -144,14 +165,40 @@ pub fn analyze_function(request: &AnalysisRequest, name: &str) -> Result<Analysi
     let result = checker.inspect(&source, stubs.as_ref(), |db, file, offset| {
         let program_file = db.program_file(file);
         let parsed = parsed_module(db, program_file.python_file(db)).load(db);
-        let function = parsed
-            .suite()
-            .iter()
-            .find_map(|stmt| match stmt {
+        let function = match selector {
+            FunctionSelector::TopLevelName(name) => parsed.suite().iter().find_map(|stmt| match stmt {
                 Stmt::FunctionDef(function) if function.name.as_str() == name => Some(function),
                 _ => None,
-            })
-            .ok_or("analysis function is absent")?;
+            }),
+            FunctionSelector::Span(span) => {
+                struct Find<'a> {
+                    span: Span,
+                    found: Option<&'a ruff_python_ast::StmtFunctionDef>,
+                }
+                impl<'a> Visitor<'a> for Find<'a> {
+                    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+                        if let Stmt::FunctionDef(function) = stmt {
+                            if function.start().to_u32() == self.span.start && function.end().to_u32() == self.span.end
+                            {
+                                self.found = Some(function);
+                                return;
+                            }
+                        }
+                        visitor::walk_stmt(self, stmt);
+                    }
+                }
+                let mut find = Find {
+                    span: Span {
+                        start: span.start + offset,
+                        end: span.end + offset,
+                    },
+                    found: None,
+                };
+                find.visit_body(parsed.suite());
+                find.found
+            }
+        }
+        .ok_or("analysis function is absent")?;
         export::function_returns(db, file, function, request.limits.max_type_references)
             .map(|graph| graph::convert(graph, offset))
             .map_err(|_| "analysis type graph limit exceeded".to_string())

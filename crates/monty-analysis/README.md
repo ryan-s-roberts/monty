@@ -14,6 +14,8 @@ those policies separately. Analysis never executes source or invokes callbacks.
 Direct calls bound source size, targets and exported references. Analysis is a synchronous in-process call, independent of the worker pool.
 Empty targets request definition checking only. Callers own CPU scheduling.
 Source, AST depth and graph limits are admission bounds, not allocator or wall-clock limits.
+`analyze_function_at` selects a top-level or nested function by its original
+source span (before stub injection) and exports its checked reachable returns.
 
 Development depends on the pinned ty structured export patch documented in
 ../../vendor/ty_python_semantic/MONTY-PATCH.md. A public release requires that
