@@ -88,7 +88,7 @@ impl Pool {
             }),
         };
         let workers = worker_count(total);
-        pool.inner.record_worker_delta(workers, workers);
+        PoolInner::record_worker_delta(&pool.inner.config, workers, workers);
         Ok(pool)
     }
 
@@ -106,7 +106,9 @@ impl Pool {
     /// `options.telemetry`) while below `max_processes`, and otherwise waits
     /// up to `checkout_timeout` (forever when `None`) before failing with
     /// [`PoolError::Exhausted`].
-    pub async fn checkout_with(&self, repl: &ReplConfig, mut options: CheckoutOptions) -> Result<Checkout, PoolError> {
+    pub async fn checkout_with(&self, repl: &ReplConfig, options: CheckoutOptions) -> Result<Checkout, PoolError> {
+        #[cfg(feature = "telemetry")]
+        let mut options = options;
         // ahead of the caller's headers, which stay last-wins
         #[cfg(feature = "telemetry")]
         if let Some(telemetry) = &options.telemetry {
@@ -145,9 +147,9 @@ impl Pool {
         .into_iter()
         .map(|worker| (worker, CapacityGuard::new(&self.inner)))
         .collect();
-        self.inner.record_worker_delta(0, -worker_count(idle.len()));
+        PoolInner::record_worker_delta(&self.inner.config, 0, -worker_count(idle.len()));
         for _ in &idle {
-            self.inner.count_termination("closed");
+            PoolInner::count_termination(&self.inner.config, "closed");
         }
         for (worker, _) in &mut idle {
             let _ = worker
@@ -261,10 +263,14 @@ impl PoolInner {
                 };
                 drop(state); // never call into the host adapter under the lock
                 for _ in 0..died_idle {
-                    self.count_termination("died_idle");
+                    Self::count_termination(&self.config, "died_idle");
                 }
                 let spawned = i64::from(below_cap);
-                self.record_worker_delta(spawned - worker_count(died_idle), -worker_count(removed_idle));
+                Self::record_worker_delta(
+                    &self.config,
+                    spawned - worker_count(died_idle),
+                    -worker_count(removed_idle),
+                );
                 if let Some(worker) = reused {
                     *outcome = if waited { "waited" } else { "idle" };
                     return Ok(worker);
@@ -296,22 +302,22 @@ impl PoolInner {
     /// Counts one worker leaving the pool. Every path that drops a worker
     /// records here or in [`crate::checkout`], so the reasons add up to the
     /// pool's whole turnover.
-    pub(crate) fn count_termination(&self, reason: &'static str) {
+    pub(crate) fn count_termination(config: &PoolConfig, reason: &'static str) {
         #[cfg(feature = "telemetry")]
-        if let Some(metrics) = &self.config.metrics {
+        if let Some(metrics) = &config.metrics {
             metrics.worker_terminated(reason);
         }
         #[cfg(not(feature = "telemetry"))]
-        let _ = reason;
+        let _ = (config, reason);
     }
 
     /// Records changes to live and immediately available workers.
     ///
     /// Call with the pool lock released to keep telemetry outside pool
     /// synchronization. Recording only updates Rust SDK aggregates.
-    pub(crate) fn record_worker_delta(&self, live: i64, idle: i64) {
+    pub(crate) fn record_worker_delta(config: &PoolConfig, live: i64, idle: i64) {
         #[cfg(feature = "telemetry")]
-        if let Some(metrics) = &self.config.metrics {
+        if let Some(metrics) = &config.metrics {
             if live != 0 {
                 metrics.live_workers(live);
             }
@@ -320,7 +326,7 @@ impl PoolInner {
             }
         }
         #[cfg(not(feature = "telemetry"))]
-        let _ = (live, idle);
+        let _ = (config, live, idle);
     }
 
     /// Returns a healthy worker to the idle queue (or retires it when it hit
@@ -334,12 +340,12 @@ impl PoolInner {
                 .is_some_and(|max| worker.checkouts_served >= max);
         if recycle {
             drop(worker); // kill (on drop) — reaped by tokio in the background
-            self.count_termination(if websocket { "single_use" } else { "recycled" });
+            Self::count_termination(&self.config, if websocket { "single_use" } else { "recycled" });
             self.release_capacity();
         } else {
             lock_ignore_poison(&self.state).idle.push(worker);
             self.available.notify_one();
-            self.record_worker_delta(0, 1);
+            Self::record_worker_delta(&self.config, 0, 1);
         }
     }
 
@@ -348,7 +354,7 @@ impl PoolInner {
     pub(crate) fn release_capacity(&self) {
         lock_ignore_poison(&self.state).total -= 1;
         self.available.notify_one();
-        self.record_worker_delta(-1, 0);
+        Self::record_worker_delta(&self.config, -1, 0);
     }
 }
 
@@ -363,9 +369,9 @@ impl Drop for PoolInner {
             let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
             (state.total, state.idle.len())
         };
-        self.record_worker_delta(-worker_count(live), -worker_count(idle));
+        Self::record_worker_delta(&self.config, -worker_count(live), -worker_count(idle));
         for _ in 0..idle {
-            self.count_termination("closed");
+            Self::count_termination(&self.config, "closed");
         }
     }
 }
@@ -425,7 +431,7 @@ impl Drop for CapacityGuard<'_> {
     fn drop(&mut self) {
         if let Some(pool) = self.pool {
             if let Some(reason) = self.reason {
-                pool.count_termination(reason);
+                PoolInner::count_termination(&pool.config, reason);
             }
             pool.release_capacity();
         }
