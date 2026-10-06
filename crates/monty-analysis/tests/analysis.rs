@@ -170,12 +170,21 @@ fn nested_function_span_exports_its_checked_body_return() {
 fn limits_and_nonexpression_targets_fail_without_partial_success() {
     let mut req = request("(1, 2)", "(1, 2)", None);
     req.limits.max_type_references = 1;
-    assert!(analyze(&req).unwrap_err().contains("graph limit"));
+    assert!(matches!(
+        analyze(&req),
+        Err(monty_analysis::AnalysisError::TypeGraphLimitExceeded { .. })
+    ));
     req.limits = AnalysisLimits::default();
     req.targets[0].end -= 1;
-    assert!(analyze(&req).unwrap_err().contains("match an expression"));
+    assert!(matches!(
+        analyze(&req),
+        Err(monty_analysis::AnalysisError::TargetExpressionMissing)
+    ));
     req.limits.max_source_bytes = 1;
-    assert!(analyze(&req).unwrap_err().contains("byte limit"));
+    assert!(matches!(
+        analyze(&req),
+        Err(monty_analysis::AnalysisError::SourceByteLimitExceeded)
+    ));
 }
 
 #[test]

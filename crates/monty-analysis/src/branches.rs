@@ -22,7 +22,7 @@ pub struct BranchRequest {
 
 /// Graph roots are ordered: all true-branch subjects, then all false-branch
 /// subjects, in request order. Never denotes an unreachable observation.
-pub fn analyze_branches(request: &BranchRequest) -> Result<AnalysisResult, String> {
+pub fn analyze_branches(request: &BranchRequest) -> Result<AnalysisResult, crate::AnalysisError> {
     let targets = request
         .subjects
         .len()
@@ -30,7 +30,7 @@ pub fn analyze_branches(request: &BranchRequest) -> Result<AnalysisResult, Strin
         .saturating_add(request.bindings.len())
         .saturating_add(1);
     if targets > request.limits.max_targets.min(1024) as usize {
-        return Err("branch analysis target limit exceeded".into());
+        return Err(crate::AnalysisError::BranchTargetLimitExceeded);
     }
     let bytes = request
         .bindings
@@ -48,7 +48,7 @@ pub fn analyze_branches(request: &BranchRequest) -> Result<AnalysisResult, Strin
                 .fold(0usize, |n, s| n.saturating_add(s.len().saturating_mul(2))),
         );
     if bytes > request.limits.max_source_bytes.min(1_048_576) as usize {
-        return Err("branch analysis source byte limit exceeded".into());
+        return Err(crate::AnalysisError::BranchSourceByteLimitExceeded);
     }
     let mut source = format!("{}\ndef __monty_branch(", request.imports);
     let mut targets = Vec::new();
@@ -57,7 +57,7 @@ pub fn analyze_branches(request: &BranchRequest) -> Result<AnalysisResult, Strin
         if !bytes.next().is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
             || !bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
         {
-            return Err("branch binding requires an ASCII identifier".into());
+            return Err(crate::AnalysisError::InvalidBranchBinding);
         }
         if index != 0 {
             source.push_str(", ");
@@ -77,11 +77,11 @@ pub fn analyze_branches(request: &BranchRequest) -> Result<AnalysisResult, Strin
         source.push_str("        pass\n");
         for subject in &request.subjects {
             source.push_str("        (");
-            let start = u32::try_from(source.len()).map_err(|_| "branch source is too large")?;
+            let start = u32::try_from(source.len()).map_err(|_| crate::AnalysisError::BranchSourceTooLarge)?;
             source.push_str(subject);
             targets.push(Span {
                 start,
-                end: u32::try_from(source.len()).map_err(|_| "branch source is too large")?,
+                end: u32::try_from(source.len()).map_err(|_| crate::AnalysisError::BranchSourceTooLarge)?,
             });
             source.push_str(")\n");
         }
@@ -98,12 +98,12 @@ pub fn analyze_branches(request: &BranchRequest) -> Result<AnalysisResult, Strin
     Ok(result)
 }
 
-fn append_target(source: &mut String, targets: &mut Vec<Span>, expression: &str) -> Result<(), String> {
-    let start = u32::try_from(source.len()).map_err(|_| "branch source is too large")?;
+fn append_target(source: &mut String, targets: &mut Vec<Span>, expression: &str) -> Result<(), crate::AnalysisError> {
+    let start = u32::try_from(source.len()).map_err(|_| crate::AnalysisError::BranchSourceTooLarge)?;
     source.push_str(expression);
     targets.push(Span {
         start,
-        end: u32::try_from(source.len()).map_err(|_| "branch source is too large")?,
+        end: u32::try_from(source.len()).map_err(|_| crate::AnalysisError::BranchSourceTooLarge)?,
     });
     Ok(())
 }

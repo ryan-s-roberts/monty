@@ -33,7 +33,7 @@ let result = analyze(&AnalysisRequest {
     limits: AnalysisLimits::default(),
 })?;
 assert!(matches!(result.outcome, AnalysisOutcome::Inferred(_)));
-# Ok::<(), String>(())
+# Ok::<(), monty_analysis::AnalysisError>(())
 ```
 
 `Node::Instance` retains the definition identity and type arguments rather than

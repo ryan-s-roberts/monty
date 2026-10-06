@@ -1,11 +1,157 @@
 //! Read-only, bounded export of inferred types. No inference rules live here.
+pub use super::call::bind::InvalidArgumentTypeProvenance;
+pub use super::callable::CallableTypeKind;
+pub use super::constraints::{
+    RejectionConstraintAtom, RejectionConstraintGraph, RejectionConstraintNode, RejectionConstraintProvenance,
+};
+pub use super::signatures::{ParameterAnnotationKind, ParameterNamePrefix};
+pub use super::typevar::TypeVarKind;
+pub use super::variance::TypeVarVariance;
+pub use ruff_python_parser::ParseError;
 use std::collections::HashMap;
+
+/// A parameter's raw name and declaration kind, not its rendered diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParameterNameEvidence {
+    pub name: String,
+    pub prefix: ParameterNamePrefix,
+}
+
+/// Exact owned scalar metadata from the call binder's parameter context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParameterEvidence {
+    pub name: Option<ParameterNameEvidence>,
+    pub signature_parameter_index: usize,
+    pub source_parameter_index: Option<usize>,
+    pub positional: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ArgumentBindingError {
+    #[error("missing positional binding")]
+    MissingPositionalBinding,
+    #[error("missing callable type")]
+    MissingCallableType,
+    #[error("ambiguous Python call binding")]
+    AmbiguousCall,
+    #[error("Python call binding rejected: {faults:?}")]
+    CallRejected {
+        faults: Vec<CallBindingFault>,
+        types: RejectionTypeGraph,
+    },
+    #[error("call rejection type evidence exceeds the export limit: {source}")]
+    EvidenceLimit {
+        #[source]
+        source: ExportLimitExceeded,
+    },
+    #[error("ambiguous argument binding at argument {argument}")]
+    AmbiguousArgument { argument: usize },
+    #[error("unnamed parameter at argument {argument}")]
+    UnnamedParameter { argument: usize },
+}
+
+/// Owned semantic evidence from database-borrowed call-binder errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallBindingFault {
+    InvalidArgumentType {
+        parameter: ParameterEvidence,
+        argument: Option<usize>,
+        last_argument: Option<usize>,
+        provenance: InvalidArgumentTypeProvenance,
+        expected: TypeId,
+        provided: TypeId,
+        parameter_source: Option<ForwardedParameterEvidence>,
+    },
+    InvalidKeyType {
+        argument: Option<usize>,
+        provided: TypeId,
+    },
+    MissingArguments {
+        parameters: Vec<ParameterEvidence>,
+        paramspec: Option<TypeId>,
+    },
+    UnknownArgument {
+        name: String,
+        argument: Option<usize>,
+    },
+    UnknownKeywordVariadicArgument {
+        argument: Option<usize>,
+    },
+    PositionalOnlyAsKeyword {
+        parameter: ParameterEvidence,
+        argument: Option<usize>,
+    },
+    TooManyPositionalArguments {
+        first_excess: Option<usize>,
+        expected: usize,
+        provided: usize,
+    },
+    ParameterAlreadyAssigned {
+        parameter: ParameterEvidence,
+        argument: Option<usize>,
+    },
+    SpecializationBound {
+        provided: TypeId,
+        typevar: TypeId,
+        argument: Option<usize>,
+    },
+    SpecializationConstraint {
+        provided: TypeId,
+        typevar: TypeId,
+        argument: Option<usize>,
+    },
+    PropertyGetterMissing {
+        property: TypeId,
+    },
+    PropertySetterMissing {
+        property: TypeId,
+    },
+    PropertyDeleterMissing {
+        property: TypeId,
+    },
+    PropertyGetterCall {
+        source: Box<PropertyAccessorEvidence>,
+    },
+    PropertySetterCall {
+        source: Box<PropertyAccessorEvidence>,
+    },
+    InternalCall {
+        operation: &'static str,
+    },
+    UnmatchedOverload,
+    TopCallable {
+        callable: TypeId,
+    },
+    DataclassNamedTuple,
+    DataclassTypedDict,
+    DataclassEnum,
+    DataclassProtocol,
+    DataclassOrderRequiresEq,
+    DataclassWeakrefSlotRequiresSlots,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardedParameterEvidence {
+    pub function: TypeId,
+    pub is_bound_method: bool,
+    pub parameter_index_offset: usize,
+    pub overload_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("property accessor call rejected at argument offset {argument_index_offset}: {overloads:?}")]
+pub struct PropertyAccessorEvidence {
+    pub callable: TypeId,
+    pub argument_index_offset: usize,
+    /// Preserve each callable group and each overload, including empty ones.
+    pub overloads: Vec<Vec<Vec<CallBindingFault>>>,
+}
 
 use ruff_db::parsed::parsed_module;
 use ruff_text_size::Ranged;
 
 use super::{
-    ClassLiteral, DynamicType, LiteralValueTypeKind, Type,
+    ClassLiteral, DynamicType, KnownClass, LiteralValueTypeKind, Type,
     tuple::{Tuple, VariableSegment},
     typed_dict::{TypedDictOpenness, TypedDictType},
 };
@@ -93,8 +239,109 @@ pub struct Graph {
     pub nodes: Vec<Node>,
 }
 
+/// Diagnostic-only evidence. These nodes do not extend materialized inference values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectionTypeGraph {
+    pub roots: Vec<TypeId>,
+    pub nodes: Vec<RejectionTypeNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectionTypeNode {
+    Value(Node),
+    FunctionLiteral {
+        identity: Identity,
+        signatures: Vec<RejectionSignature>,
+    },
+    Callable {
+        kind: CallableTypeKind,
+        signatures: Vec<RejectionSignature>,
+    },
+    PropertyInstance {
+        class: RejectionPropertyClass,
+        getter: Option<TypeId>,
+        setter: Option<TypeId>,
+        deleter: Option<TypeId>,
+    },
+    TypeVar {
+        name: String,
+        kind: TypeVarKind,
+        definition: Option<Identity>,
+        binding: Option<Identity>,
+        synthetic_binding: bool,
+        freshness: u32,
+        paramspec_attr: Option<RejectionParamSpecAttr>,
+        variance: Option<TypeVarVariance>,
+        bound_or_constraints: Option<RejectionTypeVarBounds>,
+        default: Option<TypeId>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectionPropertyClass {
+    Builtin,
+    Enum,
+    Subclass(TypeId),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectionParamSpecAttr {
+    Args,
+    Kwargs,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectionTypeVarBounds {
+    UpperBound(TypeId),
+    Constraints(Vec<TypeId>),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectionParameterKind {
+    PositionalOnly,
+    PositionalOrKeyword,
+    Variadic,
+    KeywordOnly,
+    KeywordVariadic,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectionParametersKind {
+    Standard,
+    Gradual,
+    Top,
+    ParamSpec(TypeId),
+    ConcatenateGradual,
+    ConcatenateParamSpec(TypeId),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectionParameter {
+    pub name: Option<String>,
+    pub kind: RejectionParameterKind,
+    pub annotation: TypeId,
+    pub annotation_kind: ParameterAnnotationKind,
+    pub default: Option<TypeId>,
+    pub definition: Option<Identity>,
+    pub source_parameter_index: Option<usize>,
+    pub inferred_annotation: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectionSignature {
+    pub definition: Option<Identity>,
+    pub parameters_kind: RejectionParametersKind,
+    pub parameters: Vec<RejectionParameter>,
+    pub return_type: TypeId,
+    pub generic_variables: Vec<TypeId>,
+    pub is_paramspec_value: bool,
+    pub source_overload_index: Option<u32>,
+    pub receiver_constraints: Option<RejectionConstraintGraph<TypeId>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExportLimitExceeded;
+
+impl std::fmt::Display for ExportLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("semantic export limit exceeded")
+    }
+}
+impl std::error::Error for ExportLimitExceeded {}
 
 /// Export iteratively, retaining cycles and sharing. A limit failure returns no partial graph.
 /// The limit bounds both distinct nodes and references; callers must bound input source separately.
@@ -131,6 +378,186 @@ struct Builder<'a, 'db> {
 }
 
 impl<'db> Builder<'_, 'db> {
+    fn finish_rejection_graph(&mut self) -> Result<RejectionTypeGraph, ExportLimitExceeded> {
+        let roots = (0..self.pending.len()).map(|index| TypeId(index as u32)).collect();
+        let mut nodes = Vec::new();
+        while nodes.len() < self.pending.len() {
+            nodes.push(self.rejection_node(self.pending[nodes.len()])?);
+        }
+        Ok(RejectionTypeGraph { roots, nodes })
+    }
+    fn definition_identity(&self, definition: ty_python_core::definition::Definition<'db>) -> Identity {
+        let db = self.db;
+        let parsed = parsed_module(db, definition.python_file(db)).load(db);
+        Identity {
+            source: definition.file(db).path(db).to_string(),
+            start: Some(definition.full_range(db, &parsed).range().start().to_u32()),
+            path: definition.name(db).into_iter().collect(),
+        }
+    }
+
+    fn rejection_signatures(
+        &mut self,
+        signatures: &super::signatures::CallableSignature<'db>,
+    ) -> Result<Vec<RejectionSignature>, ExportLimitExceeded> {
+        use super::signatures::{ConcatenateTail, ParameterKind, ParametersKind};
+        signatures
+            .iter()
+            .map(|signature| {
+                if self.references >= self.limit {
+                    return Err(ExportLimitExceeded);
+                }
+                self.references += 1;
+                let parameters_kind = match signature.parameters().kind() {
+                    ParametersKind::Standard => RejectionParametersKind::Standard,
+                    ParametersKind::Gradual => RejectionParametersKind::Gradual,
+                    ParametersKind::Top => RejectionParametersKind::Top,
+                    ParametersKind::ParamSpec(typevar) => {
+                        RejectionParametersKind::ParamSpec(self.intern(Type::TypeVar(typevar))?)
+                    }
+                    ParametersKind::Concatenate(ConcatenateTail::Gradual) => {
+                        RejectionParametersKind::ConcatenateGradual
+                    }
+                    ParametersKind::Concatenate(ConcatenateTail::ParamSpec(typevar)) => {
+                        RejectionParametersKind::ConcatenateParamSpec(self.intern(Type::TypeVar(typevar))?)
+                    }
+                };
+                let parameters = signature
+                    .parameters()
+                    .iter()
+                    .map(|parameter| {
+                        let kind = match parameter.kind() {
+                            ParameterKind::PositionalOnly { .. } => RejectionParameterKind::PositionalOnly,
+                            ParameterKind::PositionalOrKeyword { .. } => RejectionParameterKind::PositionalOrKeyword,
+                            ParameterKind::Variadic { .. } => RejectionParameterKind::Variadic,
+                            ParameterKind::KeywordOnly { .. } => RejectionParameterKind::KeywordOnly,
+                            ParameterKind::KeywordVariadic { .. } => RejectionParameterKind::KeywordVariadic,
+                        };
+                        Ok(RejectionParameter {
+                            name: parameter.name().map(|name| name.as_str().to_owned()),
+                            kind,
+                            annotation: self.intern(parameter.annotated_type())?,
+                            annotation_kind: parameter.rejection_annotation_kind(),
+                            default: parameter.default_type(self.db).map(|ty| self.intern(ty)).transpose()?,
+                            definition: parameter
+                                .definition()
+                                .map(|definition| self.definition_identity(definition)),
+                            source_parameter_index: parameter.source_parameter_index(),
+                            inferred_annotation: parameter.inferred_annotation,
+                        })
+                    })
+                    .collect::<Result<_, ExportLimitExceeded>>()?;
+                let generic_variables = signature
+                    .generic_context
+                    .map(|context| {
+                        context
+                            .variables(self.db)
+                            .map(|typevar| self.intern(Type::TypeVar(typevar)))
+                            .collect::<Result<Vec<_>, ExportLimitExceeded>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let (is_paramspec_value, source_overload_index) = signature.rejection_evidence_flags();
+                let remaining = self.limit.checked_sub(self.references).ok_or(ExportLimitExceeded)?;
+                let remaining = usize::try_from(remaining).map_err(|_| ExportLimitExceeded)?;
+                let receiver_constraints = signature
+                    .receiver_constraints()
+                    .map(|constraints| {
+                        constraints.rejection_projection(remaining, |ty| self.intern(ty), || ExportLimitExceeded)
+                    })
+                    .transpose()?;
+                if let Some(graph) = &receiver_constraints {
+                    let node_count = u32::try_from(graph.nodes.len()).map_err(|_| ExportLimitExceeded)?;
+                    self.references = self
+                        .references
+                        .checked_add(node_count)
+                        .filter(|references| *references <= self.limit)
+                        .ok_or(ExportLimitExceeded)?;
+                }
+                Ok(RejectionSignature {
+                    definition: signature
+                        .definition()
+                        .map(|definition| self.definition_identity(definition)),
+                    parameters_kind,
+                    parameters,
+                    return_type: self.intern(signature.return_ty)?,
+                    generic_variables,
+                    is_paramspec_value,
+                    source_overload_index,
+                    receiver_constraints,
+                })
+            })
+            .collect()
+    }
+
+    fn rejection_node(&mut self, ty: Type<'db>) -> Result<RejectionTypeNode, ExportLimitExceeded> {
+        let db = self.db;
+        Ok(match ty {
+            Type::FunctionLiteral(function) => RejectionTypeNode::FunctionLiteral {
+                identity: self.definition_identity(function.definition(db)),
+                signatures: self.rejection_signatures(function.signature(db))?,
+            },
+            Type::Callable(callable) => RejectionTypeNode::Callable {
+                kind: callable.kind(db),
+                signatures: self.rejection_signatures(callable.signatures(db))?,
+            },
+            Type::PropertyInstance(property) => {
+                let class = match property.instance_class(db) {
+                    super::PropertyInstanceClass::Builtin => RejectionPropertyClass::Builtin,
+                    super::PropertyInstanceClass::Enum => RejectionPropertyClass::Enum,
+                    super::PropertyInstanceClass::Subclass(class) => {
+                        RejectionPropertyClass::Subclass(self.intern(class.into())?)
+                    }
+                };
+                RejectionTypeNode::PropertyInstance {
+                    class,
+                    getter: property.getter(db).map(|ty| self.intern(ty)).transpose()?,
+                    setter: property.setter(db).map(|ty| self.intern(ty)).transpose()?,
+                    deleter: property.deleter(db).map(|ty| self.intern(ty)).transpose()?,
+                }
+            }
+            Type::TypeVar(typevar) => {
+                let unbound = typevar.typevar(db);
+                let identity = unbound.identity(db);
+                let bound_or_constraints = unbound
+                    .bound_or_constraints(db, self.env)
+                    .map(|bounds| {
+                        Ok::<_, ExportLimitExceeded>(match bounds {
+                            super::TypeVarBoundOrConstraints::UpperBound(bound) => {
+                                RejectionTypeVarBounds::UpperBound(self.intern(bound)?)
+                            }
+                            super::TypeVarBoundOrConstraints::Constraints(constraints) => {
+                                RejectionTypeVarBounds::Constraints(self.ids(constraints.elements(db))?)
+                            }
+                        })
+                    })
+                    .transpose()?;
+                let binding_definition = typevar.binding_context(db).definition();
+                RejectionTypeNode::TypeVar {
+                    name: typevar.name(db).as_str().to_owned(),
+                    kind: typevar.kind(db),
+                    definition: identity
+                        .definition(db)
+                        .map(|definition| self.definition_identity(definition)),
+                    binding: binding_definition.map(|definition| self.definition_identity(definition)),
+                    synthetic_binding: binding_definition.is_none(),
+                    freshness: typevar.freshness(db).value(),
+                    paramspec_attr: typevar.paramspec_attr(db).map(|attr| match attr {
+                        super::typevar::ParamSpecAttrKind::Args => RejectionParamSpecAttr::Args,
+                        super::typevar::ParamSpecAttrKind::Kwargs => RejectionParamSpecAttr::Kwargs,
+                    }),
+                    variance: unbound.explicit_variance(db),
+                    bound_or_constraints,
+                    default: unbound
+                        .default_type(db, self.env)
+                        .map(|ty| self.intern(ty))
+                        .transpose()?,
+                }
+            }
+            _ => RejectionTypeNode::Value(self.node(ty)?),
+        })
+    }
+
     fn intern(&mut self, ty: Type<'db>) -> Result<TypeId, ExportLimitExceeded> {
         if self.references >= self.limit {
             return Err(ExportLimitExceeded);
@@ -450,12 +877,12 @@ pub fn bind_one_positional(
     db: &dyn Db,
     file: ruff_db::files::File,
     function: &ruff_python_ast::StmtFunctionDef,
-) -> Result<ArgumentBinding, String> {
+) -> Result<ArgumentBinding, ArgumentBindingError> {
     let bindings = bind_arguments(db, file, function, &[None])?;
     bindings
         .into_iter()
         .next()
-        .ok_or_else(|| "missing positional binding".into())
+        .ok_or(ArgumentBindingError::MissingPositionalBinding)
 }
 
 /// Bind explicit positional and named arguments in source evaluation order.
@@ -465,14 +892,16 @@ pub fn bind_arguments(
     file: ruff_db::files::File,
     function: &ruff_python_ast::StmtFunctionDef,
     arguments: &[Option<String>],
-) -> Result<Vec<ArgumentBinding>, String> {
+) -> Result<Vec<ArgumentBinding>, ArgumentBindingError> {
     use super::call::{Argument, CallArguments};
     use super::signatures::ParameterKind;
     use crate::{HasType, SemanticModel};
     let program_file = db.program_file(file);
     let model = SemanticModel::new(db, program_file);
     let env = ProgramEnvironment::from_file(program_file);
-    let callable = function.inferred_type(&model).ok_or("missing callable type")?;
+    let callable = function
+        .inferred_type(&model)
+        .ok_or(ArgumentBindingError::MissingCallableType)?;
     let args: CallArguments = arguments
         .iter()
         .map(|name| {
@@ -484,25 +913,33 @@ pub fn bind_arguments(
         .collect();
     let bindings = callable.bindings(db, &env).match_parameters(db, &env, &args);
     let mut matches = bindings.iter_flat().flat_map(|b| b.matching_overloads());
-    let (_, binding) = matches
-        .next()
-        .ok_or("Python arguments do not match the callable signature")?;
+    let Some((_, binding)) = matches.next() else {
+        return Err(rejected_call(
+            db,
+            &env,
+            bindings.iter_flat().flatten().flat_map(|binding| binding.errors()),
+        ));
+    };
     if matches.next().is_some() {
-        return Err("ambiguous Python call binding".into());
+        return Err(ArgumentBindingError::AmbiguousCall);
     }
     if !binding.errors().is_empty() {
-        return Err(format!("Python call binding: {:?}", binding.errors()));
+        return Err(rejected_call(db, &env, binding.errors()));
     }
     binding
         .argument_matches()
         .iter()
-        .map(|argument| {
+        .enumerate()
+        .map(|(index, argument)| {
             let [matched] = argument.parameters.as_slice() else {
-                return Err("ambiguous argument binding".into());
+                return Err(ArgumentBindingError::AmbiguousArgument { argument: index });
             };
             let parameter = &binding.signature.parameters()[matched.index];
             Ok(ArgumentBinding {
-                parameter: parameter.name().ok_or("unnamed parameter")?.to_string(),
+                parameter: parameter
+                    .name()
+                    .ok_or(ArgumentBindingError::UnnamedParameter { argument: index })?
+                    .to_string(),
                 variadic: matches!(
                     parameter.kind(),
                     ParameterKind::Variadic { .. } | ParameterKind::KeywordVariadic { .. }
@@ -510,6 +947,312 @@ pub fn bind_arguments(
             })
         })
         .collect()
+}
+
+fn export_parameter_evidence(parameter: super::call::bind::ParameterContextEvidence<'_>) -> ParameterEvidence {
+    ParameterEvidence {
+        name: parameter.name.map(|(name, prefix)| ParameterNameEvidence {
+            name: name.as_str().to_owned(),
+            prefix,
+        }),
+        signature_parameter_index: parameter.signature_parameter_index,
+        source_parameter_index: parameter.source_parameter_index,
+        positional: parameter.positional,
+    }
+}
+
+fn export_binding_fault<'db>(
+    builder: &mut Builder<'_, 'db>,
+    error: &super::call::bind::BindingError<'db>,
+    depth: usize,
+) -> Result<CallBindingFault, ExportLimitExceeded> {
+    use super::call::bind::BindingError;
+    if depth >= 128 || builder.references >= builder.limit {
+        return Err(ExportLimitExceeded);
+    }
+    builder.references += 1;
+    Ok(match error {
+        BindingError::InvalidArgumentType {
+            parameter,
+            argument_index,
+            last_argument_index,
+            provenance,
+            expected_ty,
+            provided_ty,
+            parameter_source,
+        } => CallBindingFault::InvalidArgumentType {
+            parameter: export_parameter_evidence(parameter.evidence()),
+            argument: *argument_index,
+            last_argument: *last_argument_index,
+            provenance: *provenance,
+            expected: builder.intern(*expected_ty)?,
+            provided: builder.intern(*provided_ty)?,
+            parameter_source: parameter_source
+                .map(|source| {
+                    let (function, is_bound_method, parameter_index_offset, overload_index) = source.evidence_parts();
+                    Ok::<ForwardedParameterEvidence, ExportLimitExceeded>(ForwardedParameterEvidence {
+                        function: builder.intern(Type::FunctionLiteral(function))?,
+                        is_bound_method,
+                        parameter_index_offset,
+                        overload_index,
+                    })
+                })
+                .transpose()?,
+        },
+        BindingError::InvalidKeyType {
+            argument_index,
+            provided_ty,
+        } => CallBindingFault::InvalidKeyType {
+            argument: *argument_index,
+            provided: builder.intern(*provided_ty)?,
+        },
+        BindingError::MissingArguments { parameters, paramspec } => {
+            let parameters = parameters.evidence();
+            let parameter_count = u32::try_from(parameters.len()).map_err(|_| ExportLimitExceeded)?;
+            builder.references = builder
+                .references
+                .checked_add(parameter_count)
+                .filter(|references| *references <= builder.limit)
+                .ok_or(ExportLimitExceeded)?;
+            CallBindingFault::MissingArguments {
+                parameters: parameters.map(export_parameter_evidence).collect(),
+                paramspec: paramspec
+                    .map(|typevar| builder.intern(Type::TypeVar(typevar)))
+                    .transpose()?,
+            }
+        }
+        BindingError::UnknownArgument {
+            argument_name,
+            argument_index,
+        } => CallBindingFault::UnknownArgument {
+            name: argument_name.to_string(),
+            argument: *argument_index,
+        },
+        BindingError::UnknownKeywordVariadicArgument { argument_index } => {
+            CallBindingFault::UnknownKeywordVariadicArgument {
+                argument: *argument_index,
+            }
+        }
+        BindingError::PositionalOnlyParameterAsKwarg {
+            argument_index,
+            parameter,
+        } => CallBindingFault::PositionalOnlyAsKeyword {
+            argument: *argument_index,
+            parameter: export_parameter_evidence(parameter.evidence()),
+        },
+        BindingError::TooManyPositionalArguments {
+            first_excess_argument_index,
+            expected_positional_count,
+            provided_positional_count,
+        } => CallBindingFault::TooManyPositionalArguments {
+            first_excess: *first_excess_argument_index,
+            expected: *expected_positional_count,
+            provided: *provided_positional_count,
+        },
+        BindingError::ParameterAlreadyAssigned {
+            argument_index,
+            parameter,
+        } => CallBindingFault::ParameterAlreadyAssigned {
+            argument: *argument_index,
+            parameter: export_parameter_evidence(parameter.evidence()),
+        },
+        BindingError::SpecializationError { argument_index, error } => match error {
+            super::generics::SpecializationError::MismatchedBound {
+                argument,
+                bound_typevar,
+            } => CallBindingFault::SpecializationBound {
+                argument: *argument_index,
+                provided: builder.intern(*argument)?,
+                typevar: builder.intern(Type::TypeVar(*bound_typevar))?,
+            },
+            super::generics::SpecializationError::MismatchedConstraint {
+                argument,
+                bound_typevar,
+            } => CallBindingFault::SpecializationConstraint {
+                argument: *argument_index,
+                provided: builder.intern(*argument)?,
+                typevar: builder.intern(Type::TypeVar(*bound_typevar))?,
+            },
+        },
+        BindingError::PropertyHasNoGetter(property) => CallBindingFault::PropertyGetterMissing {
+            property: builder.intern(Type::PropertyInstance(*property))?,
+        },
+        BindingError::PropertyHasNoSetter(property) => CallBindingFault::PropertySetterMissing {
+            property: builder.intern(Type::PropertyInstance(*property))?,
+        },
+        BindingError::PropertyHasNoDeleter(property) => CallBindingFault::PropertyDeleterMissing {
+            property: builder.intern(Type::PropertyInstance(*property))?,
+        },
+        BindingError::PropertyGetterCallError(source) => CallBindingFault::PropertyGetterCall {
+            source: Box::new(export_accessor_evidence(builder, source, depth + 1)?),
+        },
+        BindingError::PropertySetterCallError(source) => CallBindingFault::PropertySetterCall {
+            source: Box::new(export_accessor_evidence(builder, source, depth + 1)?),
+        },
+        BindingError::InternalCallError(operation) => CallBindingFault::InternalCall { operation },
+        BindingError::UnmatchedOverload => CallBindingFault::UnmatchedOverload,
+        BindingError::CalledTopCallable(callable) => CallBindingFault::TopCallable {
+            callable: builder.intern(*callable)?,
+        },
+        BindingError::InvalidDataclassApplication(target) => match target {
+            super::call::bind::InvalidDataclassTarget::NamedTuple => CallBindingFault::DataclassNamedTuple,
+            super::call::bind::InvalidDataclassTarget::TypedDict => CallBindingFault::DataclassTypedDict,
+            super::call::bind::InvalidDataclassTarget::Enum => CallBindingFault::DataclassEnum,
+            super::call::bind::InvalidDataclassTarget::Protocol => CallBindingFault::DataclassProtocol,
+        },
+        BindingError::InvalidDataclassArgument(argument) => match argument {
+            super::call::bind::InvalidDataclassArgument::OrderRequiresEq => CallBindingFault::DataclassOrderRequiresEq,
+            super::call::bind::InvalidDataclassArgument::WeakrefSlotRequiresSlots => {
+                CallBindingFault::DataclassWeakrefSlotRequiresSlots
+            }
+        },
+    })
+}
+
+fn export_accessor_evidence<'db>(
+    builder: &mut Builder<'_, 'db>,
+    source: &super::call::bind::PropertyAccessorCallError<'db>,
+    depth: usize,
+) -> Result<PropertyAccessorEvidence, ExportLimitExceeded> {
+    let bindings = source.evidence_bindings();
+    let callable = builder.intern(bindings.callable_type())?;
+    let overloads = bindings
+        .iter_flat()
+        .map(|group| {
+            group
+                .into_iter()
+                .map(|binding| {
+                    binding
+                        .errors()
+                        .iter()
+                        .map(|fault| export_binding_fault(builder, fault, depth))
+                        .collect()
+                })
+                .collect()
+        })
+        .collect::<Result<_, ExportLimitExceeded>>()?;
+    Ok(PropertyAccessorEvidence {
+        callable,
+        argument_index_offset: source.evidence_argument_offset(),
+        overloads,
+    })
+}
+
+pub(crate) fn rejected_call<'a, 'db: 'a>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    faults: impl IntoIterator<Item = &'a super::call::bind::BindingError<'db>>,
+) -> ArgumentBindingError {
+    let mut builder = Builder {
+        db,
+        env,
+        limit: 4096,
+        references: 0,
+        ids: HashMap::new(),
+        pending: Vec::new(),
+    };
+    let result: Result<ArgumentBindingError, ExportLimitExceeded> = (|| {
+        let faults = faults
+            .into_iter()
+            .map(|fault| export_binding_fault(&mut builder, fault, 0))
+            .collect::<Result<Vec<_>, _>>()?;
+        let types = builder.finish_rejection_graph()?;
+        Ok(ArgumentBindingError::CallRejected { faults, types })
+    })();
+    result.unwrap_or_else(|source| ArgumentBindingError::EvidenceLimit { source })
+}
+
+#[cfg(test)]
+mod rejection_type_evidence_tests {
+    use super::*;
+    use crate::place::global_symbol;
+    use ruff_db::files::system_path_to_file;
+    use ruff_db::system::DbWithWritableSystem;
+    use ty_python_core::ProgramFile;
+
+    #[test]
+    fn rejection_only_nodes_preserve_signatures_property_sharing_and_typevar_bounds() {
+        let mut db = crate::db::tests::setup_db();
+        db.write_dedented(
+            "/src/rejection.py",
+            r#"
+def bounded[T: int](value: T, count: int = 1, /, *, flag: bool = False) -> T:
+    return value
+def constrained[U: (int, str)](value: U) -> U:
+    return value
+"#,
+        )
+        .unwrap();
+        let env = db.program_environment();
+        let file = system_path_to_file(&db, "/src/rejection.py").unwrap();
+        let file = ProgramFile::new(&db, file, env.program(&db));
+        let function_ty = global_symbol(&db, file, "bounded").place.expect_type();
+        let Type::FunctionLiteral(function) = function_ty else {
+            panic!("expected function literal");
+        };
+        let typevar = function
+            .signature(&db)
+            .iter()
+            .next()
+            .unwrap()
+            .generic_context
+            .unwrap()
+            .variables(&db)
+            .next()
+            .unwrap();
+        let callable =
+            super::super::callable::CallableType::new(&db, function.signature(&db).clone(), CallableTypeKind::Regular);
+        let property = super::super::PropertyInstanceType::new(&db, Some(function_ty), Some(function_ty), None);
+        let roots = [
+            function_ty,
+            Type::Callable(callable),
+            Type::PropertyInstance(property),
+            Type::TypeVar(typevar),
+            global_symbol(&db, file, "constrained").place.expect_type(),
+        ];
+        // Diagnostic support must not expand the materialized inference contract.
+        assert!(
+            export(&db, &env, &roots, 4096)
+                .unwrap()
+                .nodes
+                .iter()
+                .all(|node| matches!(node, Node::Unsupported))
+        );
+        let mut builder = Builder {
+            db: &db,
+            env: &env,
+            limit: 4096,
+            references: 0,
+            ids: HashMap::new(),
+            pending: Vec::new(),
+        };
+        let ids = builder.ids(&roots).unwrap();
+        let graph = builder.finish_rejection_graph().unwrap();
+        let RejectionTypeNode::FunctionLiteral { identity, signatures } = &graph.nodes[ids[0].0 as usize] else {
+            panic!("function collapsed");
+        };
+        assert_eq!(identity.source, "/src/rejection.py");
+        assert_eq!(identity.path, vec!["bounded"]);
+        let signature = &signatures[0];
+        assert_eq!(signature.parameters[0].name.as_deref(), Some("value"));
+        assert_eq!(signature.parameters[0].kind, RejectionParameterKind::PositionalOnly);
+        assert_eq!(signature.parameters[0].annotation, ids[3]);
+        assert_eq!(signature.return_type, ids[3]);
+        assert!(matches!(
+            graph.nodes[signature.parameters[1].default.unwrap().0 as usize],
+            RejectionTypeNode::Value(Node::IntLiteral(1))
+        ));
+        assert!(
+            matches!(&graph.nodes[ids[1].0 as usize], RejectionTypeNode::Callable { kind: CallableTypeKind::Regular, signatures } if !signatures.is_empty())
+        );
+        assert!(
+            matches!(&graph.nodes[ids[2].0 as usize], RejectionTypeNode::PropertyInstance { class: RejectionPropertyClass::Builtin, getter: Some(getter), setter: Some(setter), deleter: None } if *getter == ids[0] && *setter == ids[0])
+        );
+        assert!(
+            matches!(&graph.nodes[ids[3].0 as usize], RejectionTypeNode::TypeVar { name, kind: TypeVarKind::Pep695TypeVar, freshness: 0, bound_or_constraints: Some(RejectionTypeVarBounds::UpperBound(_)), .. } if name == "T")
+        );
+        assert!(graph.nodes.iter().any(|node| matches!(node, RejectionTypeNode::TypeVar { name, bound_or_constraints: Some(RejectionTypeVarBounds::Constraints(items)), .. } if name == "U" && items.len() == 2)));
+    }
 }
 
 /// Reachability is read from the semantic index; the embedding never decides

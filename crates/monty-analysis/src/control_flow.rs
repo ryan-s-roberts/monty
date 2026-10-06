@@ -59,10 +59,10 @@ impl FunctionFlow {
     }
 }
 
-pub fn function_flow(source: &str, target: Span) -> Result<FunctionFlow, String> {
+pub fn function_flow(source: &str, target: Span) -> Result<FunctionFlow, crate::AnalysisError> {
     inspect_function_at(source, Some(target), |db, file, function| {
-        let (ranges, _) =
-            export::reachable_statements(db, file, function).map_err(|_| "control-flow export limit exceeded")?;
+        let (ranges, _) = export::reachable_statements(db, file, function)
+            .map_err(|source| crate::AnalysisError::ControlFlowExportLimitExceeded { source })?;
         let reachable = ranges.into_iter().collect();
         sequence(&function.body, &reachable, &mut 4096, 0, &|expr| {
             export::condition_truth(db, file, expr)
@@ -75,15 +75,15 @@ fn sequence(
     budget: &mut usize,
     depth: usize,
     truth: &impl Fn(&Expr) -> Option<bool>,
-) -> Result<FunctionFlow, String> {
+) -> Result<FunctionFlow, crate::AnalysisError> {
     if depth >= 128 || *budget == 0 {
-        return Err("control-flow projection budget exceeded".into());
+        return Err(crate::AnalysisError::ControlFlowProjectionBudgetExceeded);
     }
     *budget -= 1;
     let mut steps = vec![];
     for (index, stmt) in statements.iter().enumerate() {
         if *budget == 0 {
-            return Err("control-flow projection budget exceeded".into());
+            return Err(crate::AnalysisError::ControlFlowProjectionBudgetExceeded);
         }
         *budget -= 1;
         if !reachable.contains(&(stmt.start().to_u32(), stmt.end().to_u32())) {

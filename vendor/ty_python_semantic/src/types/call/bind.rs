@@ -8780,7 +8780,24 @@ pub(crate) struct ParameterContext {
     positional: bool,
 }
 
+/// Borrowed binder metadata; ownership conversion belongs to the consumer.
+pub(crate) struct ParameterContextEvidence<'a> {
+    pub name: Option<(&'a Name, crate::types::signatures::ParameterNamePrefix)>,
+    pub signature_parameter_index: usize,
+    pub source_parameter_index: Option<usize>,
+    pub positional: bool,
+}
+
 impl ParameterContext {
+    pub(crate) fn evidence(&self) -> ParameterContextEvidence<'_> {
+        ParameterContextEvidence {
+            name: self.name.as_ref().map(ParameterDisplayName::evidence_parts),
+            signature_parameter_index: self.signature_parameter_index,
+            source_parameter_index: self.source_parameter_index,
+            positional: self.positional,
+        }
+    }
+
     fn new(parameter: &Parameter, index: usize, positional: bool) -> Self {
         Self {
             name: parameter
@@ -8809,6 +8826,102 @@ impl std::fmt::Display for ParameterContext {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ParameterContexts(Vec<ParameterContext>);
+
+impl ParameterContexts {
+    pub(crate) fn evidence(&self) -> impl ExactSizeIterator<Item = ParameterContextEvidence<'_>> {
+        self.0.iter().map(ParameterContext::evidence)
+    }
+}
+
+#[cfg(test)]
+mod parameter_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn nested_property_rejection_preserves_causes_offsets_and_shared_type_ids() {
+        use crate::types::export::{
+            ArgumentBindingError, CallBindingFault, Node, RejectionTypeNode, TypeId,
+        };
+        let db = crate::db::tests::setup_db();
+        let env = db.program_environment();
+        let arguments: CallArguments = std::iter::empty().collect();
+        let mut inner = Type::unknown()
+            .bindings(&db, &env)
+            .match_parameters(&db, &env, &arguments);
+        inner.iter_flat_mut().next().unwrap().overloads[0]
+            .errors
+            .push(BindingError::InternalCallError("property.__delete__"));
+        let mut outer = Type::unknown()
+            .bindings(&db, &env)
+            .match_parameters(&db, &env, &arguments);
+        outer.iter_flat_mut().next().unwrap().overloads[0]
+            .errors
+            .push(BindingError::PropertySetterCallError(
+                PropertyAccessorCallError {
+                    bindings: Box::new(inner),
+                    argument_index_offset: 7,
+                },
+            ));
+        let fault = BindingError::PropertyGetterCallError(PropertyAccessorCallError {
+            bindings: Box::new(outer),
+            argument_index_offset: 11,
+        });
+        let error = crate::types::export::rejected_call(&db, &env, [&fault]);
+        let ArgumentBindingError::CallRejected { faults, types } = error else {
+            panic!("expected owned rejection evidence");
+        };
+        assert_eq!(types.nodes, vec![RejectionTypeNode::Value(Node::Unknown)]);
+        let [CallBindingFault::PropertyGetterCall { source }] = faults.as_slice() else {
+            panic!("missing getter cause");
+        };
+        assert_eq!(source.callable, TypeId(0));
+        assert_eq!(source.argument_index_offset, 11);
+        let [group] = source.overloads.as_slice() else {
+            panic!("lost callable group");
+        };
+        let [overload] = group.as_slice() else {
+            panic!("lost overload");
+        };
+        let [CallBindingFault::PropertySetterCall { source }] = overload.as_slice() else {
+            panic!("missing setter cause");
+        };
+        assert_eq!(source.callable, TypeId(0));
+        assert_eq!(source.argument_index_offset, 7);
+        assert!(matches!(
+            source.overloads[0][0].as_slice(),
+            [CallBindingFault::InternalCall {
+                operation: "property.__delete__"
+            }]
+        ));
+    }
+
+    #[test]
+    fn preserves_parameter_positions_and_missing_argument_order() {
+        let parameters = ParameterContexts(vec![
+            ParameterContext {
+                name: None,
+                signature_parameter_index: 5,
+                source_parameter_index: Some(2),
+                positional: true,
+            },
+            ParameterContext {
+                name: None,
+                signature_parameter_index: 6,
+                source_parameter_index: None,
+                positional: false,
+            },
+        ]);
+        let evidence = parameters.evidence().collect::<Vec<_>>();
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(evidence[0].signature_parameter_index, 5);
+        assert_eq!(evidence[0].source_parameter_index, Some(2));
+        assert!(evidence[0].positional);
+        assert_eq!(evidence[1].signature_parameter_index, 6);
+        assert_eq!(evidence[1].source_parameter_index, None);
+        assert!(!evidence[1].positional);
+        assert!(evidence.iter().all(|parameter| parameter.name.is_none()));
+    }
+}
 
 impl std::fmt::Display for ParameterContexts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -8883,7 +8996,7 @@ impl<'db> ForwardedParameterSource<'db> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum InvalidArgumentTypeProvenance {
+pub enum InvalidArgumentTypeProvenance {
     Argument,
     OpenTypedDictExtraItems,
 }
@@ -8984,6 +9097,27 @@ pub(crate) enum BindingError<'db> {
 pub(crate) struct PropertyAccessorCallError<'db> {
     bindings: Box<Bindings<'db>>,
     argument_index_offset: usize,
+}
+
+impl<'db> PropertyAccessorCallError<'db> {
+    pub(crate) fn evidence_bindings(&self) -> &Bindings<'db> {
+        &self.bindings
+    }
+
+    pub(crate) fn evidence_argument_offset(&self) -> usize {
+        self.argument_index_offset
+    }
+}
+
+impl<'db> ForwardedParameterSource<'db> {
+    pub(crate) fn evidence_parts(self) -> (FunctionType<'db>, bool, usize, usize) {
+        (
+            self.function,
+            self.is_bound_method,
+            self.parameter_index_offset,
+            self.overload_index,
+        )
+    }
 }
 
 impl PartialEq for PropertyAccessorCallError<'_> {

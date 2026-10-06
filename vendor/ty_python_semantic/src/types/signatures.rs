@@ -763,6 +763,12 @@ impl<'db> PartialApplication<'db> {
 }
 
 impl<'db> Signature<'db> {
+    pub(crate) fn rejection_evidence_flags(&self) -> (bool, Option<u32>) {
+        (
+            self.is_paramspec_value,
+            self.source_overload_index_raw().map(NonZeroU32::get),
+        )
+    }
     pub(crate) fn new(parameters: Parameters<'db>, return_ty: Type<'db>) -> Self {
         Self {
             generic_context: None,
@@ -2040,7 +2046,7 @@ impl<'db> Signature<'db> {
             .and_then(|extras| extras.source_overload_index)
     }
 
-    fn receiver_constraints(&self) -> Option<&OwnedConstraintSet<'db>> {
+    pub(crate) fn receiver_constraints(&self) -> Option<&OwnedConstraintSet<'db>> {
         self.extras
             .as_ref()
             .and_then(|extras| extras.receiver_constraints.as_ref())
@@ -5414,6 +5420,34 @@ pub(crate) struct ParameterDisplayName<N> {
     prefix: ParameterNamePrefix,
 }
 
+impl<N> ParameterDisplayName<N> {
+    pub(crate) fn evidence_parts(&self) -> (&N, ParameterNamePrefix) {
+        (&self.name, self.prefix)
+    }
+}
+
+#[cfg(test)]
+mod parameter_name_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_raw_name_and_each_prefix() {
+        for prefix in [
+            ParameterNamePrefix::None,
+            ParameterNamePrefix::Variadic,
+            ParameterNamePrefix::KeywordVariadic,
+        ] {
+            let name = ParameterDisplayName {
+                name: Name::new("items"),
+                prefix,
+            };
+            let (raw, actual) = name.evidence_parts();
+            assert_eq!(raw.as_str(), "items");
+            assert_eq!(actual, prefix);
+        }
+    }
+}
+
 impl ParameterDisplayName<&Name> {
     pub(crate) fn into_owned(self) -> ParameterDisplayName<Name> {
         ParameterDisplayName {
@@ -5431,7 +5465,7 @@ impl<N: AsRef<str>> fmt::Display for ParameterDisplayName<N> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ParameterNamePrefix {
+pub enum ParameterNamePrefix {
     None,
     Variadic,
     KeywordVariadic,
@@ -5481,7 +5515,7 @@ pub(crate) struct Parameter<'db> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
-enum ParameterAnnotationKind {
+pub enum ParameterAnnotationKind {
     Normal,
 
     /// Variadic parameters can have starred annotations, e.g.
@@ -5832,6 +5866,10 @@ impl<'db> Parameter<'db> {
     /// Annotated type of the parameter. If no annotation was provided, this is `Unknown`.
     pub(crate) fn annotated_type(&self) -> Type<'db> {
         self.annotated_type
+    }
+
+    pub(crate) fn rejection_annotation_kind(&self) -> ParameterAnnotationKind {
+        self.annotation_kind
     }
 
     /// Returns the source definition represented by this parameter, if any.

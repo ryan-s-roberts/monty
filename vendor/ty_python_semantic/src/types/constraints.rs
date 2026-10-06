@@ -260,6 +260,61 @@ pub struct OwnedConstraintSet<'db> {
     inner: Option<Arc<OwnedConstraintSetInner<'db>>>,
 }
 
+/// Owned diagnostic projection of the exact stored decision diagram.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectionConstraintGraph<T> {
+    pub root: usize,
+    pub nodes: Vec<RejectionConstraintNode<T>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectionConstraintProvenance {
+    Validity,
+    Evidence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RejectionConstraintAtom<T> {
+    ConcreteLower {
+        provenance: RejectionConstraintProvenance,
+        typevar: T,
+        bound: T,
+    },
+    ConcreteUpper {
+        provenance: RejectionConstraintProvenance,
+        typevar: T,
+        bound: T,
+    },
+    ConcreteEquivalence {
+        provenance: RejectionConstraintProvenance,
+        typevar: T,
+        bound: T,
+    },
+    TypeVarRange {
+        provenance: RejectionConstraintProvenance,
+        left: T,
+        right: T,
+    },
+    TypeVarEquivalence {
+        provenance: RejectionConstraintProvenance,
+        left: T,
+        right: T,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RejectionConstraintNode<T> {
+    True,
+    False,
+    /// Exactly `(atom AND if_true) OR if_uncertain OR (NOT atom AND if_false)`.
+    Decision {
+        atom: RejectionConstraintAtom<T>,
+        if_true: usize,
+        if_uncertain: usize,
+        if_false: usize,
+    },
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
 struct OwnedConstraintSetInner<'db> {
     constraints: Box<[Constraint<'db>]>,
@@ -287,6 +342,89 @@ impl Default for OwnedConstraintSet<'_> {
 }
 
 impl<'db> OwnedConstraintSet<'db> {
+    /// Read-only projection; maps borrowed type handles into caller-owned evidence IDs.
+    pub(crate) fn rejection_projection<T, E>(
+        &self,
+        limit: usize,
+        mut map: impl FnMut(Type<'db>) -> Result<T, E>,
+        limit_error: impl Fn() -> E,
+    ) -> Result<RejectionConstraintGraph<T>, E> {
+        self.query(|builder, set| {
+            let storage = builder.storage.borrow();
+            let mut pending = vec![set.node];
+            let mut ids = FxHashMap::default();
+            ids.insert(set.node, 0usize);
+            let mut nodes = Vec::new();
+            while nodes.len() < pending.len() {
+                if pending.len() > limit {
+                    return Err(limit_error());
+                }
+                let id = pending[nodes.len()];
+                let node = if id == ALWAYS_TRUE {
+                    RejectionConstraintNode::True
+                } else if id == ALWAYS_FALSE {
+                    RejectionConstraintNode::False
+                } else {
+                    let data = storage.interior_node_data(id);
+                    let provenance = |value| match value {
+                        ConstraintProvenance::Validity => RejectionConstraintProvenance::Validity,
+                        ConstraintProvenance::Evidence => RejectionConstraintProvenance::Evidence,
+                    };
+                    let atom = match storage.constraint_data(data.constraint) {
+                        Constraint::ConcreteLower(bound) => {
+                            RejectionConstraintAtom::ConcreteLower {
+                                provenance: provenance(bound.provenance),
+                                typevar: map(Type::TypeVar(bound.typevar))?,
+                                bound: map(bound.bound)?,
+                            }
+                        }
+                        Constraint::ConcreteUpper(bound) => {
+                            RejectionConstraintAtom::ConcreteUpper {
+                                provenance: provenance(bound.provenance),
+                                typevar: map(Type::TypeVar(bound.typevar))?,
+                                bound: map(bound.bound)?,
+                            }
+                        }
+                        Constraint::ConcreteEquivalence(bound) => {
+                            RejectionConstraintAtom::ConcreteEquivalence {
+                                provenance: provenance(bound.provenance),
+                                typevar: map(Type::TypeVar(bound.typevar))?,
+                                bound: map(bound.bound)?,
+                            }
+                        }
+                        Constraint::TypeVarRange(bound) => RejectionConstraintAtom::TypeVarRange {
+                            provenance: provenance(bound.provenance),
+                            left: map(Type::TypeVar(bound.left))?,
+                            right: map(Type::TypeVar(bound.right))?,
+                        },
+                        Constraint::TypeVarEquivalence(bound) => {
+                            RejectionConstraintAtom::TypeVarEquivalence {
+                                provenance: provenance(bound.provenance),
+                                left: map(Type::TypeVar(bound.left))?,
+                                right: map(Type::TypeVar(bound.right))?,
+                            }
+                        }
+                    };
+                    let mut child = |id| {
+                        *ids.entry(id).or_insert_with(|| {
+                            let index = pending.len();
+                            pending.push(id);
+                            index
+                        })
+                    };
+                    RejectionConstraintNode::Decision {
+                        atom,
+                        if_true: child(data.if_true),
+                        if_uncertain: child(data.if_uncertain),
+                        if_false: child(data.if_false),
+                    }
+                };
+                nodes.push(node);
+            }
+            Ok(RejectionConstraintGraph { root: 0, nodes })
+        })
+    }
+
     pub(crate) fn always() -> Self {
         Self {
             node: ALWAYS_TRUE,
@@ -6662,6 +6800,104 @@ class E: ...
             let _unused_u_str = create_constraint(db, builder, u, KnownClass::Str);
             create_constraint(db, builder, v, KnownClass::Bool)
         })
+    }
+
+    #[test]
+    fn rejection_projection_preserves_terminals_and_limit_failure() {
+        let always = OwnedConstraintSet::always();
+        let never = OwnedConstraintSet::default();
+        for (owned, expected) in [
+            (always, RejectionConstraintNode::True),
+            (never, RejectionConstraintNode::False),
+        ] {
+            let graph = owned
+                .rejection_projection(1, |_: Type<'_>| Ok::<(), ()>(()), || ())
+                .unwrap();
+            assert_eq!(graph.root, 0);
+            assert_eq!(graph.nodes, vec![expected]);
+            assert!(
+                owned
+                    .rejection_projection(0, |_: Type<'_>| Ok::<(), ()>(()), || ())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn rejection_projection_preserves_uncertain_negation_and_atom_evidence() {
+        let db = setup_db();
+        let t = create_typevar(&db, "T");
+        let u = create_typevar(&db, "U");
+        let owned = ConstraintSetBuilder::new().into_owned(|builder| {
+            let t_int = create_constraint(&db, builder, t, KnownClass::Int);
+            let u_str = create_constraint(&db, builder, u, KnownClass::Str);
+            t_int.or(&db, builder, || u_str.negate(&db, builder))
+        });
+        let graph = owned
+            .rejection_projection(32, |ty| Ok::<_, ()>(ty), || ())
+            .unwrap();
+        assert!(graph.nodes.iter().any(|node| matches!(node,
+            RejectionConstraintNode::Decision { if_uncertain, .. }
+                if !matches!(graph.nodes[*if_uncertain], RejectionConstraintNode::False)
+        )));
+        owned.query(|builder, set| {
+            let storage = builder.storage.borrow();
+            let mut pending = vec![(set.node, graph.root)];
+            while let Some((id, projected)) = pending.pop() {
+                let node = &graph.nodes[projected];
+                if id == ALWAYS_TRUE {
+                    assert_eq!(*node, RejectionConstraintNode::True);
+                    continue;
+                }
+                if id == ALWAYS_FALSE {
+                    assert_eq!(*node, RejectionConstraintNode::False);
+                    continue;
+                }
+                let original = storage.interior_node_data(id);
+                let RejectionConstraintNode::Decision {
+                    atom,
+                    if_true,
+                    if_uncertain,
+                    if_false,
+                } = node
+                else {
+                    panic!("decision collapsed");
+                };
+                let Constraint::ConcreteEquivalence(bound) =
+                    storage.constraint_data(original.constraint)
+                else {
+                    panic!("unexpected atom");
+                };
+                assert_eq!(
+                    *atom,
+                    RejectionConstraintAtom::ConcreteEquivalence {
+                        provenance: match bound.provenance {
+                            ConstraintProvenance::Validity =>
+                                RejectionConstraintProvenance::Validity,
+                            ConstraintProvenance::Evidence =>
+                                RejectionConstraintProvenance::Evidence,
+                        },
+                        typevar: Type::TypeVar(bound.typevar),
+                        bound: bound.bound,
+                    }
+                );
+                pending.extend([
+                    (original.if_true, *if_true),
+                    (original.if_uncertain, *if_uncertain),
+                    (original.if_false, *if_false),
+                ]);
+            }
+        });
+        assert!(
+            owned
+                .rejection_projection(1, |ty| Ok::<_, ()>(ty), || ())
+                .is_err()
+        );
+        assert!(
+            owned
+                .rejection_projection(32, |_| Err::<Type<'_>, _>(()), || ())
+                .is_err()
+        );
     }
 
     #[test]
