@@ -775,6 +775,16 @@ pub fn function_returns(
         .into_iter()
         .filter(|ret| crate::reachability::is_range_reachable(db, &index, scope, ret.range()))
         .map(|ret| match ret.value.as_deref() {
+            // An empty return literal contributes no element or key evidence.
+            // Export its exact lower bound instead of the checker's Unknown
+            // placeholder, which is useful for later mutation of local lists
+            // but cannot describe a closed function return contract.
+            Some(ruff_python_ast::Expr::List(list)) if list.elts.is_empty() => {
+                KnownClass::List.to_specialized_instance(db, &env, &[Type::Never])
+            }
+            Some(ruff_python_ast::Expr::Dict(dict)) if dict.items.is_empty() => {
+                KnownClass::Dict.to_specialized_instance(db, &env, &[Type::Never, Type::Never])
+            }
             Some(expr) => expr.inferred_type(&model).unwrap_or(Type::unknown()),
             None => Type::none(db, &env),
         })

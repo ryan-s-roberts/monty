@@ -59,6 +59,25 @@ fn tuples_literals_and_nested_containers_preserve_structure() {
 }
 
 #[test]
+fn empty_return_collections_export_lower_bound_elements() {
+    let source = "def f(flag: bool):\n    if flag:\n        return []\n    return ['song']\n";
+    let request = AnalysisRequest {
+        source: source.into(),
+        stubs: None,
+        targets: vec![],
+        limits: AnalysisLimits::default(),
+    };
+    let AnalysisOutcome::Inferred(graph) = monty_analysis::analyze_function(&request, "f").unwrap().outcome else {
+        panic!("expected inferred return contracts");
+    };
+    let Node::Instance { identity, arguments } = &graph.nodes[graph.roots[0].0 as usize] else {
+        panic!("expected list return: {graph:?}");
+    };
+    assert_eq!(identity.path.last().map(String::as_str), Some("list"));
+    assert_eq!(graph.nodes[arguments[0].0 as usize], Node::Never);
+}
+
+#[test]
 fn record_presence_readonly_union_and_nominal_are_retained() {
     let stubs = "from typing import TypedDict, NotRequired, ReadOnly, NewType\nSongId = NewType('SongId', int)\nclass Row(TypedDict):\n    id: SongId\n    description: NotRequired[ReadOnly[str | None]]\ndef row() -> Row: ...\n";
     let graph = infer("value = row()", "row()", Some(stubs));
