@@ -404,6 +404,7 @@ fn create_js_class_type<'e>(
     obj.set_named_property("id", class.id.to_string())?;
     obj.set_named_property("hostDefined", class.host_defined)?;
     obj.set_named_property("isDataclass", class.is_dataclass)?;
+    obj.set_named_property("recordAccess", class.record_access)?;
     obj.set_named_property("attrs", create_js_attr_pairs(&class.attrs, graph, built, env)?)?;
     Ok(obj)
 }
@@ -972,6 +973,7 @@ struct ClassHeader {
     id: MontyUuid,
     host_defined: bool,
     is_dataclass: bool,
+    record_access: bool,
 }
 
 impl ClassHeader {
@@ -982,6 +984,7 @@ impl ClassHeader {
             id: get_uuid_string_property(obj, "id", "ClassType")?,
             host_defined: obj.get_named_property("hostDefined")?,
             is_dataclass: obj.get_named_property("isDataclass")?,
+            record_access: obj.get_named_property("recordAccess")?,
         })
     }
 
@@ -992,6 +995,7 @@ impl ClassHeader {
             id: self.id,
             host_defined: self.host_defined,
             is_dataclass: self.is_dataclass,
+            record_access: self.record_access,
             attrs,
         }))
     }

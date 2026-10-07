@@ -271,7 +271,23 @@ impl MontyObject {
             id,
             host_defined,
             is_dataclass,
+            record_access: false,
             attrs,
+        })));
+        Self { graph, root }
+    }
+
+    /// A host record type: eager fields support both attributes and string-key indexing.
+    #[must_use]
+    pub fn record_type(name: impl Into<String>, id: MontyUuid) -> Self {
+        let mut graph = MontyGraph::new();
+        let root = graph.push(MontyNode::ClassType(Box::new(ClassTypeNode {
+            name: name.into(),
+            id,
+            host_defined: true,
+            is_dataclass: false,
+            record_access: true,
+            attrs: Vec::new(),
         })));
         Self { graph, root }
     }

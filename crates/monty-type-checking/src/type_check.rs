@@ -1,6 +1,9 @@
 use std::{fmt, io::ErrorKind, mem};
 
-use monty_types::{TypeCheckingConfig, TypeCheckingFormat};
+use monty_types::{
+    TypeCheckingConfig, TypeCheckingFormat,
+    analysis::{AnalysisDiagnostic, Span as AnalysisSpan},
+};
 use ruff_db::{
     Db as _,
     diagnostic::{
@@ -16,6 +19,111 @@ use salsa::Setter as _;
 use ty_python_semantic::{Db as _, check_file_unwrap};
 
 use crate::db::{MemoryDb, SRC_ROOT};
+
+/// Independent bridge faults; no database handles or analysis envelopes escape.
+#[derive(Debug)]
+pub enum TypeCheckerError {
+    RemoveSource {
+        path: SystemPathBuf,
+        source: std::io::Error,
+    },
+    RemoveDirectory {
+        path: SystemPathBuf,
+        source: std::io::Error,
+    },
+    WriteSource {
+        path: SystemPathBuf,
+        source: std::io::Error,
+    },
+    StubImportLength {
+        bytes: usize,
+        source: std::num::TryFromIntError,
+    },
+    SourceLength {
+        bytes: usize,
+        source: std::num::TryFromIntError,
+    },
+    SourceLookup {
+        path: SystemPathBuf,
+        source: ruff_db::files::FileError,
+    },
+    LexicalSyntax {
+        source: ty_python_semantic::types::export::ParseError,
+        additional: Vec<ty_python_semantic::types::export::ParseError>,
+    },
+}
+
+impl fmt::Display for TypeCheckerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RemoveSource { path, source } => write!(f, "cannot remove pooled checker source `{path}`: {source}"),
+            Self::RemoveDirectory { path, source } => {
+                write!(f, "cannot remove pooled checker directory `{path}`: {source}")
+            }
+            Self::WriteSource { path, source } => write!(f, "cannot write checker source `{path}`: {source}"),
+            Self::StubImportLength { bytes, source } => {
+                write!(f, "stub import length {bytes} exceeds source offsets: {source}")
+            }
+            Self::SourceLength { bytes, source } => write!(f, "source length {bytes} exceeds source offsets: {source}"),
+            Self::SourceLookup { path, source } => write!(f, "cannot resolve checker source `{path}`: {source}"),
+            Self::LexicalSyntax { source, .. } => write!(f, "invalid Python syntax in lexical analysis: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for TypeCheckerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RemoveSource { source, .. } | Self::RemoveDirectory { source, .. } => Some(source),
+            Self::WriteSource { source, .. } => Some(source),
+            Self::StubImportLength { source, .. } | Self::SourceLength { source, .. } => Some(source),
+            Self::SourceLookup { source, .. } => Some(source),
+            Self::LexicalSyntax { source, .. } => Some(source),
+        }
+    }
+}
+
+#[cfg(test)]
+mod source_error_tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn cleanup_faults_preserve_paths_and_io_causes() {
+        let path = SystemPathBuf::from("/src/session/module.py");
+        let file_error = TypeCheckerError::RemoveSource {
+            path: path.clone(),
+            source: std::io::Error::from(ErrorKind::PermissionDenied),
+        };
+        let TypeCheckerError::RemoveSource { path: actual, .. } = &file_error else {
+            unreachable!();
+        };
+        assert_eq!(actual, &path);
+        assert_eq!(
+            file_error
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+
+        let directory_error = TypeCheckerError::RemoveDirectory {
+            path: SystemPathBuf::from("/src/session"),
+            source: std::io::Error::from(ErrorKind::NotADirectory),
+        };
+        assert_eq!(
+            directory_error
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            ErrorKind::NotADirectory
+        );
+    }
+}
 
 /// Definition of a source file.
 pub struct SourceFile<'a> {
@@ -51,13 +159,23 @@ impl TypeChecker {
     /// # Returns
     /// * `Ok(None)` - If there are no typing errors.
     /// * `Ok(Some(string))` - If there are typing errors.
-    /// * `Err(String)` - If there was an unexpected/internal error during type checking.
+    /// * `Err(TypeCheckerError)` - If source setup or bridge inspection fails.
     pub fn run<'a>(
         &'a mut self,
         python_source: &SourceFile<'_>,
         stubs_file: Option<&SourceFile<'_>>,
         config: TypeCheckingConfig,
-    ) -> Result<Option<TypeCheckingDiagnostics<'a>>, String> {
+    ) -> Result<Option<TypeCheckingDiagnostics<'a>>, TypeCheckerError> {
+        self.run_checked(python_source, stubs_file, config, false)
+    }
+
+    fn run_checked<'a>(
+        &'a mut self,
+        python_source: &SourceFile<'_>,
+        stubs_file: Option<&SourceFile<'_>>,
+        config: TypeCheckingConfig,
+        errors_only: bool,
+    ) -> Result<Option<TypeCheckingDiagnostics<'a>>, TypeCheckerError> {
         let src_root = SystemPathBuf::from(SRC_ROOT);
         let main_path = src_root.join(python_source.path);
         let main_source = python_source.source_code;
@@ -72,7 +190,10 @@ impl TypeChecker {
                 .split_once('.')
                 .map_or(stubs_file.path, |(before, _)| before);
             let mut new_source = format!("from {stub_stem} import *\n");
-            let offset = u32::try_from(new_source.len()).map_err(to_string)?;
+            let offset = u32::try_from(new_source.len()).map_err(|source| TypeCheckerError::StubImportLength {
+                bytes: new_source.len(),
+                source,
+            })?;
             new_source.push_str(main_source);
 
             let main_file = self.write_root_file(&main_path, &new_source)?;
@@ -88,7 +209,14 @@ impl TypeChecker {
         // (e.g. deeply nested parentheses that ruff's parser rejects) would silently
         // type-check clean.
         let mut diagnostics = check_file_unwrap(&self.db, self.db.program_file(main_file));
-        diagnostics.retain(filter_diagnostics);
+        diagnostics.retain(|d| {
+            filter_diagnostics(d)
+                && (!errors_only
+                    || matches!(
+                        d.severity(),
+                        ruff_db::diagnostic::Severity::Error | ruff_db::diagnostic::Severity::Fatal
+                    ))
+        });
 
         if diagnostics.is_empty() {
             Ok(None)
@@ -100,7 +228,11 @@ impl TypeChecker {
             // and then adjust each span in the error message to account for the injected stubs import
             if code_offset > 0 {
                 let offset = TextSize::new(code_offset);
-                let source_len = TextSize::try_from(main_source.len()).map_err(to_string)?;
+                let source_len =
+                    TextSize::try_from(main_source.len()).map_err(|source| TypeCheckerError::SourceLength {
+                        bytes: main_source.len(),
+                        source,
+                    })?;
                 for diagnostic in &mut diagnostics {
                     // Adjust spans in main diagnostic annotations (only for spans in the main file)
                     for ann in diagnostic.annotations_mut() {
@@ -125,13 +257,96 @@ impl TypeChecker {
         }
     }
 
+    /// Inspect checked source with database-borrowed handles confined to the callback.
+    /// The callback must return owned data; callers own reset/isolation policy.
+    #[doc(hidden)]
+    pub fn inspect<R>(
+        &mut self,
+        source: &SourceFile<'_>,
+        stubs: Option<&SourceFile<'_>>,
+        inspect: impl for<'db> FnOnce(&'db dyn ty_python_semantic::Db, File, u32) -> R,
+    ) -> Result<Result<R, Vec<AnalysisDiagnostic>>, TypeCheckerError> {
+        if let Some(diagnostics) = self.run_checked(source, stubs, TypeCheckingConfig::default(), true)? {
+            let owned = diagnostics
+                .diagnostics
+                .iter()
+                .map(|d| {
+                    let primary = d.primary_span();
+                    AnalysisDiagnostic {
+                        code: d.id().to_string(),
+                        message: {
+                            // Preserve checker evidence such as operand types;
+                            // the headline alone can imply an operator is absent.
+                            let mut parts = vec![d.headline_message().to_string()];
+                            for annotation in d.annotations() {
+                                if let Some(message) = annotation.get_message() {
+                                    if !parts.iter().any(|part| part == message) {
+                                        parts.push(message.to_owned());
+                                    }
+                                }
+                            }
+                            parts.join("; ")
+                        },
+                        source: primary.as_ref().map(|s| match s.file() {
+                            UnifiedFile::Ty(file) => file.path(&diagnostics.type_checker.db).to_string(),
+                            UnifiedFile::Ruff(file) => file.name().to_string(),
+                        }),
+                        span: primary.and_then(|s| s.range()).map(|r| AnalysisSpan {
+                            start: r.start().to_u32(),
+                            end: r.end().to_u32(),
+                        }),
+                    }
+                })
+                .collect();
+            return Ok(Err(owned));
+        }
+        let offset = stubs.map_or(0, |stub| {
+            let stem = stub.path.split_once('.').map_or(stub.path, |(stem, _)| stem);
+            // run has already checked this length fits u32.
+            u32::try_from(format!("from {stem} import *\n").len()).expect("checked import length")
+        });
+        let path = SystemPathBuf::from(SRC_ROOT).join(source.path);
+        let file = system_path_to_file(&self.db, &path).map_err(|source| TypeCheckerError::SourceLookup {
+            path: path.clone(),
+            source,
+        })?;
+        Ok(Ok(inspect(&self.db, file, offset)))
+    }
+
+    /// Inspect the upstream semantic index without requesting type admission.
+    /// This is for lexical facts in host languages with unresolved host calls;
+    /// it is not evidence that the program is well typed or executable.
+    #[doc(hidden)]
+    pub fn inspect_syntax<R>(
+        &mut self,
+        source: &SourceFile<'_>,
+        inspect: impl for<'db> FnOnce(&'db dyn ty_python_semantic::Db, File) -> R,
+    ) -> Result<R, TypeCheckerError> {
+        let path = SystemPathBuf::from(SRC_ROOT).join(source.path);
+        let file = self.write_root_file(&path, source.source_code)?;
+        let parsed = ruff_db::parsed::parsed_module(&self.db, self.db.program_file(file).python_file(&self.db));
+        let loaded = parsed.load(&self.db);
+        if let Some((source, additional)) = loaded.errors().split_first() {
+            return Err(TypeCheckerError::LexicalSyntax {
+                source: source.clone(),
+                additional: additional.to_vec(),
+            });
+        }
+        Ok(inspect(&self.db, file))
+    }
+
     /// Write one root file into the db and remember it for mandatory cleanup.
     ///
     /// A path already tracked from an earlier `run` is overwritten rather than
     /// tracked twice: a session rewrites the same script path on every feed,
     /// so the tracking list must not grow with the number of feeds.
-    fn write_root_file(&mut self, path: &SystemPathBuf, source: &str) -> Result<File, String> {
-        self.db.write_file(path, source).map_err(to_string)?;
+    fn write_root_file(&mut self, path: &SystemPathBuf, source: &str) -> Result<File, TypeCheckerError> {
+        self.db
+            .write_file(path, source)
+            .map_err(|source| TypeCheckerError::WriteSource {
+                path: path.clone(),
+                source,
+            })?;
         self.bump_revisions(path);
 
         // The write above succeeded, so interning the path must succeed — otherwise the
@@ -151,12 +366,17 @@ impl TypeChecker {
     /// Panics if `path` is not already tracked — the caller would otherwise be
     /// leaving an untracked write behind that cleanup would miss, so a later
     /// [`Self::reset`] would leave the file visible to the next session.
-    fn rewrite_root_file(&mut self, path: &SystemPathBuf, source: &str) -> Result<(), String> {
+    fn rewrite_root_file(&mut self, path: &SystemPathBuf, source: &str) -> Result<(), TypeCheckerError> {
         assert!(
             self.touched_files.iter().any(|t| &t.path == path),
             "rewrite_root_file called for untracked path '{path}' — must call write_root_file first",
         );
-        self.db.write_file(path, source).map_err(to_string)?;
+        self.db
+            .write_file(path, source)
+            .map_err(|source| TypeCheckerError::WriteSource {
+                path: path.clone(),
+                source,
+            })?;
         self.bump_revisions(path);
         Ok(())
     }
@@ -194,7 +414,7 @@ impl TypeChecker {
     /// empty. Shared parent directories collapse naturally once the last file
     /// inside them is gone. We sync `SRC_ROOT` once at the end so the next
     /// session cannot observe the previous root directory listing.
-    pub fn reset(&mut self) -> Result<(), String> {
+    pub fn reset(&mut self) -> Result<(), TypeCheckerError> {
         let touched_files = mem::take(&mut self.touched_files);
 
         for touched in touched_files.iter().rev() {
@@ -302,15 +522,15 @@ impl TouchedRootFile {
     /// `DirectoryNotEmpty` (silently swallowed) and the second succeeds once its
     /// file is gone. This gives us correct cleanup without needing to sort paths
     /// or coordinate across `TouchedRootFile`s.
-    fn cleanup(&self, db: &mut MemoryDb) -> Result<(), String> {
+    fn cleanup(&self, db: &mut MemoryDb) -> Result<(), TypeCheckerError> {
         match db.memory_file_system().remove_file(&self.path) {
             Ok(()) => {}
             Err(err) if err.kind() == ErrorKind::NotFound => {}
             Err(err) => {
-                return Err(format!(
-                    "Failed to remove pooled type-check file '{}': {err}",
-                    self.path
-                ));
+                return Err(TypeCheckerError::RemoveSource {
+                    path: self.path.clone(),
+                    source: err,
+                });
             }
         }
         self.file.sync(db);
@@ -328,16 +548,15 @@ impl TouchedRootFile {
                 // removed by a later `cleanup` call. Every ancestor above this
                 // one is necessarily also non-empty (they contain this directory),
                 // so there is no point walking further up.
-                //
-                // `MemoryFileSystem::remove_directory` reports "directory not
-                // empty" as `io::Error::other(...)` (kind `Other`), so we match on
-                // the message rather than on `ErrorKind::DirectoryNotEmpty`.
-                Err(err) if err.to_string().contains("directory not empty") => break,
+                Err(err) if err.kind() == ErrorKind::DirectoryNotEmpty => break,
                 // `NotFound` at this point would mean the directory never existed
                 // or was already removed, both of which indicate a logic bug
                 // (e.g. the same path tracked twice) — fail loudly.
                 Err(err) => {
-                    return Err(format!("Failed to remove pooled type-check directory '{dir}': {err}"));
+                    return Err(TypeCheckerError::RemoveDirectory {
+                        path: dir.to_path_buf(),
+                        source: err,
+                    });
                 }
             }
             File::sync_path(db, dir);
@@ -345,9 +564,4 @@ impl TouchedRootFile {
         }
         Ok(())
     }
-}
-
-/// Convert a displayable error into the string type used throughout type checking.
-pub(crate) fn to_string(err: impl fmt::Display) -> String {
-    err.to_string()
 }

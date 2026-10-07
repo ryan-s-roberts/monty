@@ -471,6 +471,7 @@ fn value_allocations_are_measured_independently() {
         id: MontyUuid::from_u128(123),
         host_defined: false,
         is_dataclass: false,
+        record_access: false,
         attrs: vec![(NodeId(0), NodeId(1))],
     };
     let values = [

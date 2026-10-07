@@ -267,6 +267,9 @@ pub struct Type {
     /// for a sandbox class.
     #[prost(message, optional, tag = "5")]
     pub attrs: ::core::option::Option<crate::WireNodePairs>,
+    /// Host records expose eager fields by string-key indexing.
+    #[prost(bool, tag = "6")]
+    pub record_access: bool,
 }
 /// A class instance crossing the sandbox boundary. Host-backed instances route
 /// method calls and lazy attribute lookups back to the real object by uuid

@@ -193,6 +193,7 @@ pub(super) struct ClassHeader {
     pub(super) host_defined: bool,
     /// Whether `dataclasses.is_dataclass` is true for the class.
     pub(super) is_dataclass: bool,
+    pub(super) record_access: bool,
 }
 
 /// Read-only proxy for a class instance the host has no original object for:

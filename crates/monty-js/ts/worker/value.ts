@@ -281,6 +281,7 @@ export class ArenaEncoder {
       id: uuidString(object.id, 'ClassType id'),
       hostDefined: object.hostDefined === true,
       isDataclass: object.isDataclass === true,
+      recordAccess: object.recordAccess === true,
     }
     const seen = this.memo.get(object)
     if (seen === IN_PROGRESS) {
@@ -343,6 +344,7 @@ interface ClassHeader {
   id: string
   hostDefined: boolean
   isDataclass: boolean
+  recordAccess: boolean
 }
 
 /** What a frame builds once its children are pushed. */
@@ -519,6 +521,7 @@ function decodeNode(node: ValueNode, holder: number, child: (index: number, hold
           id: node.val.id,
           hostDefined: node.val.hostDefined,
           isDataclass: node.val.isDataclass,
+          recordAccess: node.val.recordAccess,
           attrs: attrPairs(node.val.attrs, pair),
         },
       }

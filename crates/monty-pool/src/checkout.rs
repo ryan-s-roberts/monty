@@ -2097,7 +2097,7 @@ impl Checkout {
     fn release_worker(&mut self) {
         if let Some(worker) = self.worker.take() {
             drop(worker);
-            self.pool.count_termination("discarded");
+            PoolInner::count_termination(&self.pool.config, "discarded");
             self.pool.release_capacity();
         }
     }
@@ -2109,7 +2109,7 @@ impl Drop for Checkout {
         // pool: kill the worker and free its capacity
         if let Some(worker) = self.worker.take() {
             drop(worker);
-            self.pool.count_termination("abandoned");
+            PoolInner::count_termination(&self.pool.config, "abandoned");
             self.pool.release_capacity();
         }
         #[cfg(feature = "telemetry")]

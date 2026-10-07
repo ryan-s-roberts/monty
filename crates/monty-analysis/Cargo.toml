@@ -1,0 +1,21 @@
+[package]
+name = "monty-analysis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository = "https://github.com/ryan-s-roberts/monty"
+description = "Non-executing Python type analysis using Monty's checker and sandbox typeshed"
+readme = "README.md"
+
+[dependencies]
+monty-types.workspace = true
+monty-type-checking.workspace = true
+ruff_db.workspace = true
+ruff_python_ast.workspace = true
+ruff_text_size.workspace = true
+ty_python_semantic.workspace = true
+thiserror = "1.0"
+
+[lints]
+workspace = true

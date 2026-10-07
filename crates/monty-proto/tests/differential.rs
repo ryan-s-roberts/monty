@@ -44,6 +44,7 @@ fn corpus() -> Vec<MontyObject> {
         MontyObject::ellipsis(),
         MontyObject::not_implemented(),
         MontyObject::none(),
+        MontyObject::record_type("Record", MontyUuid::from_u128(999)),
         MontyObject::bool(false), // oneof arms encode even at default payloads
         MontyObject::bool(true),
         MontyObject::int(0),
@@ -251,6 +252,7 @@ fn graphs() -> Vec<MontyGraph> {
         id: MontyUuid::from_u128(0xF10),
         host_defined: true,
         is_dataclass: true,
+        record_access: false,
         attrs: vec![],
     })));
     let one = shared_class.push(MontyNode::Int(1));
@@ -398,6 +400,7 @@ fn oracle_class_type(class: &ClassTypeNode) -> oracle::Type {
         id: Some(oracle_uuid(&class.id)),
         origin: origin as i32,
         is_dataclass: class.is_dataclass,
+        record_access: class.record_access,
         attrs,
     }
 }
@@ -767,6 +770,16 @@ fn invalid_values_are_rejected_during_decode() {
         ]),
         "frame decode error: failed to decode Protobuf message: invalid value for ClassInstanceNode.instance_id: uuid must be 16 bytes, got 17"
     );
+    for origin in [oracle::TypeOrigin::Builtin, oracle::TypeOrigin::Sandbox] {
+        assert_eq!(
+            rejected(Kind::Type(oracle::Type {
+                origin: origin as i32,
+                record_access: true,
+                ..class_type("Foo")
+            })),
+            "frame decode error: failed to decode Protobuf message: invalid value for Type: record access requires a host type"
+        );
+    }
     // an origin outside the enum is rejected rather than defaulted
     assert_eq!(
         rejected(Kind::Type(oracle::Type {
@@ -835,6 +848,7 @@ fn present_but_empty_class_attrs_decode_as_absent() {
         id: MontyUuid::from_u128(0x0707_0707_0707_0707_0707_0707_0707_0707),
         host_defined: false,
         is_dataclass: false,
+        record_access: false,
         attrs: vec![],
     }));
     let with_empty_attrs = oracle::Type {

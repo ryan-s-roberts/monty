@@ -1,0 +1,1100 @@
+# Callables as descriptors?
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+## Introduction
+
+Some common callable objects (all functions, including lambdas) are also bound-method descriptors.
+That is, they have a `__get__` method which returns a bound-method object that binds the receiver
+instance to the first argument. The bound-method object therefore has a different signature, lacking
+the first argument:
+
+```py
+from ty_extensions._internal import RegularCallableTypeOf
+from typing import Any, Callable
+
+class C1:
+    def method(self: C1, x: int) -> str:
+        return str(x)
+
+def _(
+    accessed_on_class: RegularCallableTypeOf[C1.method],
+    accessed_on_instance: RegularCallableTypeOf[C1().method],
+):
+    reveal_type(accessed_on_class)  # revealed: (self: C1, x: int) -> str
+    reveal_type(accessed_on_instance)  # revealed:        (x: int) -> str
+```
+
+Other callable objects (`staticmethod` objects, instances of classes with a `__call__` method but no
+dedicated `__get__` method) are *not* bound-method descriptors. If accessed as class attributes via
+an instance, they are simply themselves:
+
+```py
+class NonDescriptorCallable2:
+    def __call__(self, c2: C2, x: int) -> str:
+        return str(x)
+
+class C2:
+    non_descriptor_callable: NonDescriptorCallable2 = NonDescriptorCallable2()
+
+def _(
+    accessed_on_class: RegularCallableTypeOf[C2.non_descriptor_callable],
+    accessed_on_instance: RegularCallableTypeOf[C2().non_descriptor_callable],
+):
+    reveal_type(accessed_on_class)  # revealed:    (c2: C2, x: int) -> str
+    reveal_type(accessed_on_instance)  # revealed: (c2: C2, x: int) -> str
+```
+
+Both kinds of objects can inhabit the same `Callable` type:
+
+```py
+class NonDescriptorCallable3:
+    def __call__(self, c3: C3, x: int) -> str:
+        return str(x)
+
+class C3:
+    def method(self: C3, x: int) -> str:
+        return str(x)
+    non_descriptor_callable: NonDescriptorCallable3 = NonDescriptorCallable3()
+
+    callable_m: Callable[[C3, int], str] = method
+    callable_n: Callable[[C3, int], str] = non_descriptor_callable
+```
+
+However, when they are accessed on instances of `C3`, they have different signatures:
+
+```py
+def _(
+    method_accessed_on_instance: RegularCallableTypeOf[C3().method],
+    callable_accessed_on_instance: RegularCallableTypeOf[C3().non_descriptor_callable],
+):
+    reveal_type(method_accessed_on_instance)  # revealed:           (x: int) -> str
+    reveal_type(callable_accessed_on_instance)  # revealed: (c3: C3, x: int) -> str
+```
+
+This leaves the question how the `callable_m` and `callable_n` attributes should be treated when
+accessed on instances of `C3`. If we treat `Callable` as being equivalent to a protocol that defines
+a `__call__` method (and no `__get__` method), then they should show no bound-method behavior. This
+is what we currently do:
+
+```py
+reveal_type(C3().callable_m)  # revealed: (C3, int, /) -> str
+reveal_type(C3().callable_n)  # revealed: (C3, int, /) -> str
+```
+
+However, this leads to unsoundness: `C3().callable_m` is actually `C3.method` which *is* a
+bound-method descriptor. We currently allow the following call, which will fail at runtime:
+
+```py
+C3().callable_m(C3(), 1)  # runtime error! ("takes 2 positional arguments but 3 were given")
+```
+
+If we were to treat `Callable`s as bound-method descriptors, then the signatures of `callable_m` and
+`callable_n` when accessed on instances would bind the `self` argument:
+
+- `C3().callable_m`: `(x: int) -> str`
+- `C3().callable_n`: `(x: int) -> str`
+
+This would be equally unsound, because now we would allow a call to `C3().callable_n(1)` which would
+also fail at runtime.
+
+There is no perfect solution here, but we can use some heuristics to improve the situation for
+certain use cases (at the cost of purity and simplicity).
+
+## Use case: Decorating a method with a `Callable`-typed decorator
+
+A commonly used pattern in the ecosystem is to use a `Callable`-typed decorator on a method with the
+intention that it shouldn't influence the method's descriptor behavior. For example, we treat
+`method_decorated` below as a bound method, even though its type is `Callable[[C1, int], str]`:
+
+```py
+from typing import Any, Callable
+
+def memoize[**P, R](f: Callable[P, R]) -> Callable[P, R]:
+    raise NotImplementedError
+
+class C1:
+    def method(self, x: int) -> str:
+        return str(x)
+
+    @memoize
+    def method_decorated(self, x: int) -> str:
+        return str(x)
+
+C1().method(1)
+
+C1().method_decorated(1)
+```
+
+This also works with an argumentless `Callable` annotation:
+
+```py
+def memoize2(f: Callable[..., Any]) -> Callable[..., Any]:
+    raise NotImplementedError
+
+class C2:
+    @memoize2
+    def method_decorated(self, x: int) -> str:
+        return str(x)
+
+C2().method_decorated(1)
+```
+
+A generic decorator must preserve a type variable bound by the method's enclosing class, even when
+the decorator uses an ellipsis instead of a `ParamSpec`:
+
+```py
+def preserve_return[R](function: Callable[..., R]) -> Callable[..., R]:
+    return function
+
+class DecoratedBox[T]:
+    @preserve_return
+    def value(self) -> T:
+        raise NotImplementedError
+
+    @preserve_return
+    def values(self) -> list[T]:
+        raise NotImplementedError
+
+reveal_type(DecoratedBox[int]().value())  # revealed: int
+reveal_type(DecoratedBox[int]().values())  # revealed: list[int]
+```
+
+The same behavior applies to decorators and classes using legacy type variables:
+
+```py
+from typing import Generic, TypeVar
+
+LegacyT = TypeVar("LegacyT")
+LegacyR = TypeVar("LegacyR")
+
+def legacy_preserve_return(function: Callable[..., LegacyR]) -> Callable[..., LegacyR]:
+    return function
+
+class LegacyDecoratedBox(Generic[LegacyT]):
+    @legacy_preserve_return
+    def value(self) -> LegacyT:
+        raise NotImplementedError
+
+reveal_type(LegacyDecoratedBox[int]().value())  # revealed: int
+```
+
+And if the callable-typed decorator leaves some generic parameters unconstrained, we should keep
+those parameters unspecialized rather than collapsing them to `Never`:
+
+```py
+def passthrough[T, R](f: Callable[[T], R]) -> Callable[[T], R]:
+    raise NotImplementedError
+
+@passthrough
+def f(x):
+    return x
+
+reveal_type(f)  # revealed: (Unknown, /) -> Unknown
+reveal_type(f(1))  # revealed: Unknown
+```
+
+And with unions of `Callable` types:
+
+```py
+from typing import Callable
+
+def expand(f: Callable[[C3, int], int]) -> Callable[[C3, int], int] | Callable[[C3, int], str]:
+    raise NotImplementedError
+
+class C3:
+    @expand
+    def method_decorated(self, x: int) -> int:
+        return x
+
+reveal_type(C3().method_decorated(1))  # revealed: int | str
+```
+
+Transparent decorators are also treated consistently when spelled as an equivalent assignment:
+
+```py
+class C4:
+    def method(self, x: int) -> str:
+        return str(x)
+    method_decorated = memoize(method)
+
+C4().method_decorated(1)
+```
+
+For non-transparent decorators, avoid resolving the decorated function's signature before the
+decorator itself has been rejected. Doing so can introduce a cycle when the signature refers back to
+the decorated name:
+
+```py
+decorated = lambda: decorated
+try:
+    pass
+except* Exception:
+    pass
+
+unknown_decorator: Any
+
+# error: [dynamic-function-decorator-return]
+@unknown_decorator  # error: [unresolved-reference]
+def decorated(argument: lambda: decorated, /):  # error: [invalid-type-form]
+    pass
+```
+
+In general, a function call might however return a `Callable` that is unrelated to the argument
+passed in. And here, it seems more reasonable and safe to treat the `Callable` as a non-descriptor.
+This allows correct programs like the following to pass type checking (that are currently rejected
+by pyright and mypy with a heuristic that apparently applies in a wider range of situations):
+
+```py
+class SquareCalculator:
+    def __init__(self, post_process: Callable[[float], int]):
+        self.post_process = post_process
+
+    def __call__(self, x: float) -> int:
+        return self.post_process(x * x)
+
+def square_then(c: Callable[[float], int]) -> Callable[[float], int]:
+    return SquareCalculator(c)
+
+class Calculator:
+    square_then_round = square_then(round)
+
+reveal_type(Calculator().square_then_round(3.14))  # revealed: int
+```
+
+## Generic decorators with protocol-bound receivers
+
+A signature-preserving decorator whose type variable is bounded by a protocol preserves method
+binding. A class with the decorated method can satisfy that protocol, and subclasses can override
+the method with the same signature.
+
+```py
+from typing import Callable, Protocol
+
+class P(Protocol):
+    def method(self) -> None: ...
+
+def identity[T: P](func: Callable[[T], None]) -> Callable[[T], None]:
+    return func
+
+class Base:
+    @identity
+    def method(self) -> None:
+        pass
+
+class Derived(Base):
+    def method(self) -> None:
+        pass
+
+base: P = Base()
+reveal_type(Base().method)  # revealed: () -> None
+Base().method()
+```
+
+## Decorators with explicit protocol receivers
+
+The same applies when a nongeneric decorator names the protocol as the receiver type directly.
+Checking whether the class satisfies the protocol requires binding the same decorated method.
+
+```py
+from typing import Callable, Protocol
+
+class P(Protocol):
+    def method(self) -> int: ...
+
+def identity(func: Callable[[P], int]) -> Callable[[P], int]:
+    return func
+
+class Base:
+    @identity
+    def method(self: P) -> int:
+        return 1
+
+base: P = Base()
+reveal_type(Base().method)  # revealed: () -> int
+```
+
+Binding the receiver does not make incompatible overrides or protocol implementations valid.
+
+```py
+class ExtraArgument(Base):
+    def method(self, value: int) -> int:  # error: [invalid-method-override]
+        return value
+
+class WrongReturn(Base):
+    def method(self) -> str:  # error: [invalid-method-override]
+        return "wrong result"
+
+wrong_return: P = WrongReturn()  # error: [invalid-assignment]
+```
+
+## Use case: Wrappers with explicit receivers
+
+`trio` defines multiple functions that takes in a callable with `Concatenate`-prepended receiver
+types, and returns a wrapper function with a different receiver type. They should still preserve
+descriptor behavior when the returned callable is assigned in the class body.
+
+```py
+from collections.abc import Callable, Iterable
+from typing import Concatenate, ParamSpec, TypeVar
+
+P = ParamSpec("P")
+T = TypeVar("T")
+
+class RawPath:
+    def write_bytes(self, data: bytes) -> int:
+        raise NotImplementedError
+
+def _wrap_method(
+    fn: Callable[Concatenate[RawPath, P], T],
+) -> Callable[Concatenate["Path", P], T]:
+    raise NotImplementedError
+
+class Path:
+    write_bytes = _wrap_method(RawPath.write_bytes)
+
+def check(path: Path) -> None:
+    # TODO: shouldn't be errors, should reveal `int`
+    # error: [missing-argument]
+    # error: [invalid-argument-type]
+    reveal_type(path.write_bytes(b""))  # revealed: int
+```
+
+## Use case: Treating dunder methods as bound-method descriptors
+
+pytorch defines a `__pow__` dunder attribute on [`TensorBase`] in a similar way to the following
+example. We generally treat dunder attributes as bound-method descriptors since they all take a
+`self` argument. This allows us to type-check the following code correctly:
+
+```py
+from typing import Callable
+
+def pow_impl(tensor: Tensor, exponent: int) -> Tensor:
+    raise NotImplementedError
+
+class Tensor:
+    __pow__: Callable[[Tensor, int], Tensor] = pow_impl
+
+Tensor() ** 2
+```
+
+The following example is also taken from a real world project. Here, the `__lt__` dunder attribute
+is not declared. The attribute type is inferred as `Callable[…]`, but we still treat it as a
+bound-method descriptor:
+
+```py
+def make_comparison_operator(name: str) -> Callable[[Matrix, Matrix], bool]:
+    raise NotImplementedError
+
+class Matrix:
+    __lt__ = make_comparison_operator("lt")
+
+Matrix() < Matrix()
+```
+
+The dunder-name heuristic does not apply when the callable takes no arguments, because it cannot
+accept a receiver:
+
+```py
+class Thunk:
+    __value_thunk__: Callable[[], int]
+
+    def replace(self, other: "Thunk") -> None:
+        self.__value_thunk__ = other.__value_thunk__
+
+reveal_type(Thunk().__value_thunk__)  # revealed: () -> int
+```
+
+For other concrete signatures, the heuristic does not check whether the first parameter can accept
+the instance:
+
+```py
+def descriptor_candidate(value: str) -> int:
+    return len(value)
+
+class DescriptorCandidate:
+    __value__: Callable[[str], int] = descriptor_candidate
+
+reveal_type(DescriptorCandidate().__value__)  # revealed: () -> int
+```
+
+A gradual callable signature might accept the receiver, so we preserve the function-descriptor
+heuristic. This also preserves function attributes on class access:
+
+```py
+from typing import Any
+
+class Method:
+    __call__: Callable[..., Any]
+
+Method.__call__.__code__
+```
+
+## `self`-binding behaviour of function-like `Callable`s
+
+Binding the `self` parameter of a function-like `Callable` creates a new `Callable` that is also
+function-like:
+
+`main.py`:
+
+```py
+from typing import Callable
+
+def my_lossy_decorator(fn: Callable[..., int]) -> Callable[..., int]:
+    return fn
+
+class MyClass:
+    @my_lossy_decorator
+    def method(self) -> int:
+        return 42
+
+reveal_type(MyClass().method)  # revealed: (...) -> int
+reveal_type(MyClass().method.__name__)  # revealed: str
+```
+
+## classmethods passed through Callable-returning decorators
+
+The behavior described above is also applied to classmethods. If a method is decorated with
+`@classmethod`, and also with another decorator which returns a Callable type, we make the
+assumption that the decorator returns a callable which still has the classmethod descriptor
+behavior.
+
+```py
+from typing import Callable
+
+def callable_identity[**P, R](func: Callable[P, R]) -> Callable[P, R]:
+    return func
+
+class C:
+    @callable_identity
+    @classmethod
+    def f1(cls, x: int) -> str:
+        return "a"
+
+    @classmethod
+    @callable_identity
+    def f2(cls, x: int) -> str:
+        return "a"
+
+# error: [too-many-positional-arguments]
+# error: [invalid-argument-type]
+C.f1(C, 1)
+C.f1(1)
+C().f1(1)
+C.f2(1)
+C().f2(1)
+```
+
+## Decorators returning unions of callables
+
+A decorator can return a union of callables with different signatures. `staticmethod` accepts the
+union and leaves each signature unchanged.
+
+```py
+from collections.abc import Callable
+
+def static_decorator(function: object) -> Callable[[int], int] | Callable[[int, str], str]:
+    raise NotImplementedError
+
+class C:
+    @staticmethod
+    @static_decorator
+    def static() -> None: ...
+
+reveal_type(C.static)  # revealed: ((int, /) -> int) | ((int, str, /) -> str)
+reveal_type(C().static)  # revealed: ((int, /) -> int) | ((int, str, /) -> str)
+```
+
+`classmethod` binds the first parameter of each alternative to the class. This also works when the
+union is expressed through a type alias.
+
+```py
+type ClassCallables = Callable[[type, int], int] | Callable[[type, int, str], str]
+
+def class_decorator(function: object) -> ClassCallables:
+    raise NotImplementedError
+
+class D:
+    @classmethod
+    @class_decorator
+    def class_method(cls) -> None: ...
+
+reveal_type(D.class_method)  # revealed: ((int, /) -> int) | ((int, str, /) -> str)
+reveal_type(D().class_method)  # revealed: ((int, /) -> int) | ((int, str, /) -> str)
+```
+
+## Decorators returning a possibly non-callable value
+
+A decorator might return a non-callable value. We report an error when `staticmethod` is applied to
+such a return type.
+
+```py
+from collections.abc import Callable
+
+def maybe_callable(function: object) -> Callable[[], int] | int:
+    raise NotImplementedError
+
+class Invalid:
+    # error: [invalid-argument-type]
+    @staticmethod
+    @maybe_callable
+    def method() -> None: ...
+```
+
+## Callable wrappers retain attributes and overloads
+
+An object returned by a decorator can have attributes and an overloaded `__call__` method. Here,
+`Wrapper` exposes a `reset` method and returns its second argument, with overloads for `int` and
+`str`.
+
+```py
+from collections.abc import Callable
+from typing import overload
+
+class Wrapper:
+    def __init__(self, function: Callable[..., object]) -> None: ...
+    def reset(self) -> None: ...
+    @overload
+    def __call__(self, receiver: object, value: int) -> int: ...
+    @overload
+    def __call__(self, receiver: object, value: str) -> str: ...
+    def __call__(self, receiver: object, value: int | str) -> int | str:
+        return value
+```
+
+Accessing a staticmethod through a class or instance returns the wrapper unchanged. Its attributes
+remain accessible, and each call uses the matching overload's return type.
+
+```py
+class C:
+    @staticmethod
+    @Wrapper
+    def static(receiver: object, value: int | str) -> int | str:
+        return value
+
+C.static.reset()
+reveal_type(C.static(None, 1))  # revealed: int
+reveal_type(C().static(None, "a"))  # revealed: str
+```
+
+Accessing a classmethod supplies the class as the wrapper's first argument. The bound method also
+exposes the wrapper's attributes and preserves its overloads.
+
+```py
+class D:
+    @classmethod
+    @Wrapper
+    def class_method(cls, value: int | str) -> int | str:
+        return value
+
+D().class_method.reset()
+reveal_type(D.class_method(1))  # revealed: int
+reveal_type(D().class_method("a"))  # revealed: str
+```
+
+Calling `staticmethod` and `classmethod` explicitly has the same effect as using them as decorators.
+
+```py
+class Explicit:
+    static = staticmethod(C.static)
+    class_method = classmethod(C.static)
+
+Explicit.static.reset()
+Explicit().class_method.reset()
+reveal_type(Explicit.static(None, 1))  # revealed: int
+reveal_type(Explicit().static(None, "a"))  # revealed: str
+reveal_type(Explicit.class_method(1))  # revealed: int
+reveal_type(Explicit().class_method("a"))  # revealed: str
+
+# error: [no-matching-overload]
+Explicit.class_method(None)
+```
+
+A bound classmethod is assignable to a `Callable` whose signature matches one of its overloads after
+the class argument has been supplied.
+
+```py
+method: Callable[[int], int] = Explicit.class_method
+```
+
+The bound method's `__self__` attribute identifies the class, and `__func__` exposes the wrapper.
+Calling `__call__` explicitly also supplies the class argument.
+
+```py
+reveal_type(Explicit.class_method.__self__)  # revealed: <class 'Explicit'>
+reveal_type(Explicit.class_method.__func__)  # revealed: Wrapper
+reveal_type(Explicit.class_method.__call__(1))  # revealed: int
+```
+
+## Checking the receiver of a wrapped classmethod
+
+Calling a classmethod passes the owner class to its wrapped callable. That implicit argument must be
+compatible with the callable's first parameter, just like an explicit argument.
+
+```py
+class Wrapper:
+    def __call__(self, cls: int) -> int:
+        return cls + 1
+
+class C:
+    method = classmethod(Wrapper())
+
+C.method()  # error: [invalid-argument-type]
+C().method()  # error: [invalid-argument-type]
+```
+
+Receiver checking also selects the appropriate overload for the class used to access the method. The
+selected overload still checks the explicit arguments.
+
+```py
+from typing import overload
+
+class OverloadedWrapper:
+    @overload
+    def __call__(self, cls: type[Base], value: int) -> int: ...
+    @overload
+    def __call__(self, cls: type[Other], value: str) -> str: ...
+    def __call__(self, cls: type[Base] | type[Other], value: int | str) -> int | str:
+        return value
+
+class Base:
+    method = classmethod(OverloadedWrapper())
+
+class Child(Base): ...
+
+class Other:
+    method = classmethod(OverloadedWrapper())
+
+reveal_type(Base.method(1))  # revealed: int
+reveal_type(Child.method(1))  # revealed: int
+reveal_type(Other.method("x"))  # revealed: str
+Base.method("x")  # error: [no-matching-overload]
+Other.method(1)  # error: [no-matching-overload]
+```
+
+## Extracted `__call__` methods do not bind again
+
+A bound method's `__call__` retains the method's signature. Storing it on another class does not
+bind that class's instance to its first remaining parameter.
+
+```py
+from types import MethodWrapperType
+
+class A:
+    def method(self, value: int) -> int:
+        return value
+
+callback = A().method.__call__
+reveal_type(callback.__name__)  # revealed: str
+reveal_type(callback.__qualname__)  # revealed: str
+reveal_type(bool(callback))  # revealed: Literal[True]
+method_wrapper: MethodWrapperType = callback
+
+class B:
+    callback = callback
+
+reveal_type(B.callback(1))  # revealed: int
+reveal_type(B().callback(1))  # revealed: int
+B().callback("wrong")  # error: [invalid-argument-type]
+```
+
+The same applies to `__call__` extracted from a `staticmethod` descriptor: its underlying function
+still requires all its declared arguments after the extracted method is stored on a class.
+
+```py
+def stringify(value: int) -> str:
+    return str(value)
+
+wrapped = staticmethod(stringify)
+callback = wrapped.__call__
+reveal_type(callback.__name__)  # revealed: str
+reveal_type(callback.__qualname__)  # revealed: str
+reveal_type(bool(callback))  # revealed: Literal[True]
+method_wrapper: MethodWrapperType = callback
+
+class C:
+    callback = callback
+
+reveal_type(C.callback(1))  # revealed: str
+reveal_type(C().callback(1))  # revealed: str
+C().callback("wrong")  # error: [invalid-argument-type]
+```
+
+## Generic inference for method wrappers
+
+When a generic function returns a mutable container, inference can widen literal types in its
+argument. A method wrapper remains assignable to the inferred type when its callable's return type
+widens from a string literal to `str`.
+
+```py
+def as_list[T](value: T) -> list[T]:
+    return [value]
+
+reveal_type(as_list(classmethod(lambda cls: ""))[0].__func__(object))  # revealed: str
+reveal_type(as_list(staticmethod(lambda: ""))[0]())  # revealed: str
+```
+
+## Type relations between method wrappers
+
+Wrappers of the same kind preserve the type relationships between their wrapped callables. A
+callable returning `str` can be used where one returning `object` is expected, but the reverse is
+not safe. The wrapper types overlap because they can contain the same callable.
+
+```py
+from typing import Callable
+from ty_extensions import static_assert
+from ty_extensions._internal import TypeOf, is_assignable_to, is_disjoint_from, is_subtype_of
+
+def _(str_fn: Callable[[object], str], object_fn: Callable[[object], object]):
+    str_class = classmethod(str_fn)
+    object_class = classmethod(object_fn)
+    str_static = staticmethod(str_fn)
+    object_static = staticmethod(object_fn)
+
+    static_assert(is_subtype_of(TypeOf[str_class], TypeOf[object_class]))
+    static_assert(not is_assignable_to(TypeOf[object_class], TypeOf[str_class]))
+    static_assert(not is_disjoint_from(TypeOf[str_class], TypeOf[object_class]))
+
+    static_assert(is_subtype_of(TypeOf[str_static], TypeOf[object_static]))
+    static_assert(not is_assignable_to(TypeOf[object_static], TypeOf[str_static]))
+    static_assert(not is_disjoint_from(TypeOf[str_static], TypeOf[object_static]))
+    # Classmethods and staticmethods are distinct descriptor types, even with the same callable.
+    static_assert(not is_assignable_to(TypeOf[str_class], TypeOf[str_static]))
+    static_assert(not is_assignable_to(TypeOf[str_static], TypeOf[str_class]))
+    static_assert(is_disjoint_from(TypeOf[str_class], TypeOf[str_static]))
+```
+
+The wrapped object's attributes also matter. Sharing a call signature does not make a base-class
+instance assignable to a subclass that provides additional attributes.
+
+```py
+class Base:
+    def __call__(self, cls: object) -> str:
+        return ""
+
+class Derived(Base):
+    extra: int
+
+def _(base: Base, derived: Derived):
+    base_method = classmethod(base)
+    derived_method = classmethod(derived)
+
+    static_assert(is_subtype_of(TypeOf[derived_method], TypeOf[base_method]))
+    static_assert(not is_assignable_to(TypeOf[base_method], TypeOf[derived_method]))
+    static_assert(not is_disjoint_from(TypeOf[base_method], TypeOf[derived_method]))
+```
+
+Descriptors wrapping distinct function objects are disjoint, even when those functions have the same
+signature.
+
+```py
+def first(cls: object) -> None: ...
+def second(cls: object) -> None: ...
+
+first_method = classmethod(first)
+second_method = classmethod(second)
+static_assert(is_disjoint_from(TypeOf[first_method], TypeOf[second_method]))
+```
+
+## Assigning wrappers to annotated descriptor types
+
+A `staticmethod` annotation constrains both the parameters and the return type of the wrapped
+callable. A wrapper returning `str` cannot satisfy a descriptor that promises to return `int`.
+
+```py
+def stringify(value: int) -> str:
+    return str(value)
+
+def consume(method: staticmethod[[int], int]) -> int:
+    return method(1) + 1
+
+wrapped = staticmethod(stringify)
+consume(wrapped)  # error: [invalid-argument-type]
+valid: staticmethod[[int], str] = wrapped
+wrong_parameter: staticmethod[[str], str] = wrapped  # error: [invalid-assignment]
+wider_return: staticmethod[[int], object] = wrapped
+```
+
+The class argument is part of a `classmethod` annotation's wrapped-callable contract.
+
+```py
+class Owner: ...
+class Other: ...
+
+def make(cls: type[Owner], value: int) -> str:
+    return str(value)
+
+class_wrapped = classmethod(make)
+valid_class: classmethod[Owner, [int], str] = class_wrapped
+wrong_return: classmethod[Owner, [int], int] = class_wrapped  # error: [invalid-assignment]
+wrong_owner: classmethod[Other, [int], str] = class_wrapped  # error: [invalid-assignment]
+wrong_kind: staticmethod[[type[Owner], int], str] = class_wrapped  # error: [invalid-assignment]
+```
+
+An overloaded wrapper can satisfy the signature selected by the descriptor annotation without
+combining unrelated overload return types.
+
+```py
+from typing import overload
+
+@overload
+def convert(value: int) -> str: ...
+@overload
+def convert(value: str) -> int: ...
+def convert(value: int | str) -> int | str:
+    return str(value) if isinstance(value, int) else len(value)
+
+int_to_str: staticmethod[[int], str] = staticmethod(convert)
+str_to_int: staticmethod[[str], int] = staticmethod(convert)
+invalid_overload: staticmethod[[int], int] = staticmethod(convert)  # error: [invalid-assignment]
+```
+
+## Decorators returning a different function
+
+An inner decorator can replace a method with a function defined elsewhere. The outer `classmethod`
+decorator binds that replacement function to the class, even though the replacement's own definition
+has no decorators.
+
+```py
+from ty_extensions._internal import TypeOf
+
+def replacement(cls: type, value: int) -> int:
+    return value
+
+def replace_method(original: object) -> TypeOf[replacement]:
+    return replacement
+
+class C:
+    @classmethod
+    @replace_method
+    def method(cls, value: int) -> int:
+        return value
+
+reveal_type(C.method(1))  # revealed: int
+reveal_type(C().method(1))  # revealed: int
+```
+
+The bound method's `__func__` refers to the replacement function.
+
+```py
+reveal_type(C.method.__func__)  # revealed: def replacement(cls: type, value: int) -> int
+```
+
+## Types are not bound-method descriptors
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+The callable type of a type object is not function-like.
+
+```py
+from typing import ClassVar
+from ty_extensions._internal import RegularCallableTypeOf
+
+class WithNew:
+    def __new__(self, x: int) -> WithNew:
+        return super().__new__(WithNew)
+
+class WithInit:
+    def __init__(self, x: int) -> None:
+        pass
+
+class C:
+    with_new: ClassVar[RegularCallableTypeOf[WithNew]]
+    with_init: ClassVar[RegularCallableTypeOf[WithInit]]
+
+C.with_new(1)
+C().with_new(1)
+C.with_init(1)
+C().with_init(1)
+```
+
+## Decorators returning PEP 695 type aliases
+
+When a decorator's return type is a PEP 695 type alias that wraps a `Callable` type, the decorated
+method should still behave as a bound-method descriptor. This also works correctly with `super()`.
+
+```py
+from typing import Any
+from collections.abc import Callable
+
+type Func = Callable[[Any], str]
+
+def noop(func: Func) -> Func:
+    return func
+
+class Base:
+    @noop
+    def foo(self) -> str:
+        return "base"
+
+class Derived(Base):
+    @noop
+    def foo(self) -> str:
+        return super().foo()
+
+reveal_type(Base().foo)  # revealed: () -> str
+reveal_type(Derived().foo)  # revealed: () -> str
+
+# These calls should work without errors
+Base().foo()
+Derived().foo()
+```
+
+The same applies to methods accessed via `super()` directly:
+
+```py
+from typing import Any
+from collections.abc import Callable
+
+type MethodType = Callable[[Any, int], str]
+
+def decorator(func: MethodType) -> MethodType:
+    return func
+
+class Parent:
+    @decorator
+    def method(self, x: int) -> str:
+        return str(x)
+
+class Child(Parent):
+    @decorator
+    def method(self, x: int) -> str:
+        # super().method should be a bound method, not require `self`
+        return super().method(x)
+
+reveal_type(Parent().method)  # revealed: (int, /) -> str
+reveal_type(Child().method)  # revealed: (int, /) -> str
+
+Parent().method(1)
+Child().method(1)
+```
+
+## Recursive receiver protocols across overloads
+
+Each overload introduces its own type variables, even when two overloads have identical signatures.
+Binding the receiver preserves these variables when its protocol refers back to the same method.
+
+```py
+from typing import Protocol, overload
+
+class P[T](Protocol):
+    def method(self) -> T: ...
+
+@overload
+def method[T](obj: P[T]) -> T: ...
+@overload
+def method[U](obj: P[U]) -> U: ...
+@overload
+def method(obj: object) -> int: ...
+def method(obj):
+    raise NotImplementedError
+
+class C:
+    method = method
+
+reveal_type(C().method)  # revealed: Overload[[T]() -> T, [U]() -> U, () -> int]
+```
+
+## Concrete overload alternatives with a recursive receiver
+
+A recursive protocol-typed receiver also works with concrete overloads that accept different
+argument types. Binding the receiver preserves both concrete alternatives.
+
+```py
+from typing import Protocol, overload
+
+class P[T](Protocol):
+    def method(self, arg: T) -> None: ...
+
+@overload
+def method[T](obj: P[T], arg: T) -> None: ...
+@overload
+def method(obj: object, arg: int) -> None: ...
+@overload
+def method(obj: object, arg: str) -> None: ...
+def method(obj, arg):
+    raise NotImplementedError
+
+class C:
+    method = method
+
+reveal_type(C().method)  # revealed: Overload[[T](arg: T) -> None, (arg: int) -> None, (arg: str) -> None]
+```
+
+## Recursive receiver protocols with tuple parameters
+
+The receiver's type variables can occur together in a tuple parameter and separately in the return
+type. Binding the receiver preserves both variables and the concrete overload alternatives.
+
+```py
+from typing import Protocol, overload
+
+class P[A, R](Protocol):
+    def method(self, arg: tuple[A, R]) -> R: ...
+
+@overload
+def method[A, R](obj: P[A, R], arg: tuple[A, R]) -> R: ...
+@overload
+def method(obj: object, arg: tuple[int, str]) -> str: ...
+@overload
+def method(obj: object, arg: tuple[str, int]) -> int: ...
+def method(obj, arg):
+    raise NotImplementedError
+
+class C:
+    method = method
+
+# revealed: Overload[[A, R](arg: tuple[A, R]) -> R, (arg: tuple[int, str]) -> str, (arg: tuple[str, int]) -> int]
+reveal_type(C().method)
+C().method((1, "x"))
+C().method(("x", 1))
+C().method((1,))  # error: [no-matching-overload]
+```
+
+## Recursive receiver protocols with invariant containers
+
+Type variables in invariant containers also survive receiver binding. Calls still enforce the
+parameter's container shape after the recursive receiver constraints have been resolved.
+
+```py
+from typing import Protocol, overload
+
+class P[A, R](Protocol):
+    def method(self, arg: list[A]) -> list[R]: ...
+
+@overload
+def method[A, R](obj: P[A, R], arg: list[A]) -> list[R]: ...
+@overload
+def method(obj: object, arg: list[int]) -> list[int]: ...
+@overload
+def method(obj: object, arg: list[str]) -> list[str]: ...
+def method(obj, arg):
+    raise NotImplementedError
+
+class C:
+    method = method
+
+# revealed: Overload[[A, R](arg: list[A]) -> list[R], (arg: list[int]) -> list[int], (arg: list[str]) -> list[str]]
+reveal_type(C().method)
+C().method([1])
+C().method(["x"])
+C().method(1)  # error: [no-matching-overload]
+```
+
+## Builtin functions with recursive receiver protocols
+
+Assigning `pow` to a class's `__pow__` attribute is valid. Its overloads accept protocols describing
+that same method, so receiver checking is recursive.
+
+```py
+class C:
+    __pow__ = pow
+```
+
+[`tensorbase`]: https://github.com/pytorch/pytorch/blob/f3913ea641d871f04fa2b6588a77f63efeeb9f10/torch/_tensor.py#L1084-L1092

@@ -1204,7 +1204,7 @@ async fn one_huge_write_is_split_at_the_size_threshold() {
     let pool = Pool::new(config()).await.unwrap();
     // an interval nothing will reach, so only the size threshold can flush
     let repl = ReplConfig {
-        print_flush_interval: Some(Duration::from_secs(600)),
+        print_flush_interval: Some(Duration::from_mins(10)),
         ..ReplConfig::default()
     };
     let mut session = pool.checkout(&repl).await.unwrap();
@@ -2672,7 +2672,7 @@ async fn a_rewound_feed_clock_cannot_loosen_the_feed_backstop() {
     let pool = Pool::new(config).await.unwrap();
     let mut checkout = pool
         .checkout(&ReplConfig {
-            limits: Some(ResourceLimits::default().max_feed_duration(Duration::from_secs(60))),
+            limits: Some(ResourceLimits::default().max_feed_duration(Duration::from_mins(1))),
             ..ReplConfig::default()
         })
         .await
