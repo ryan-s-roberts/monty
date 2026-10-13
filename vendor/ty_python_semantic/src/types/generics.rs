@@ -1168,6 +1168,32 @@ pub(super) fn walk_specialization_types<'db, V: TypeVisitor<'db> + ?Sized>(
 }
 
 impl<'db> Specialization<'db> {
+    /// Normalize inference bounds independently of their carrier's nominal nesting.
+    pub(super) fn normalize_inference_bounds(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        cycle: &salsa::Cycle,
+        previous: Option<Self>,
+    ) -> Self {
+        let types = self.map_types(db, |index, _, bound| {
+            match previous.and_then(|previous| previous.types(db).get(index).copied()) {
+                Some(previous) => bound.cycle_normalized(db, env, previous, cycle),
+                None => bound.recursive_type_normalized(db, env, cycle),
+            }
+        });
+        if matches!(types, Cow::Borrowed(_)) {
+            return self;
+        }
+        Self::new(
+            db,
+            self.generic_context(db),
+            types.into_owned().into_boxed_slice(),
+            self.materialization_kind(db),
+            self.tuple_inner(db),
+        )
+    }
+
     /// Merge cycle iterations that differ only by gradual `Unknown` type arguments.
     ///
     /// Known argument mismatches are not merged because doing so would be unsound for invariant

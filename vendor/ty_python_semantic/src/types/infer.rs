@@ -144,6 +144,27 @@ fn normalize_collection_use_constraints<'db>(
     }
 }
 
+/// A mutable initializer solves equations for its element variables. Its
+/// collection shell is fixed, so that shell is not another recursive layer in
+/// those equations. Recursive values inside an element retain normal handling.
+fn normalize_collection_elements<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    current: Type<'db>,
+    previous: Type<'db>,
+    cycle: &salsa::Cycle,
+) -> Type<'db> {
+    if let Some((class, specialization)) = current.class_specialization(db, env) {
+        let previous = previous
+            .class_specialization(db, env)
+            .filter(|(previous_class, _)| *previous_class == class)
+            .map(|(_, specialization)| specialization);
+        let specialization = specialization.normalize_inference_bounds(db, env, cycle, previous);
+        return Type::instance(db, env, class.apply_specialization(db, |_| specialization));
+    }
+    current.cycle_normalized(db, env, previous, cycle)
+}
+
 /// Infer all types for a [`Definition`] (including sub-expressions).
 /// Use when resolving a place use or public type of a place.
 #[salsa::tracked(
@@ -483,9 +504,13 @@ pub(crate) fn infer_expression_types<'db>(
     returns(ref),
     cycle_initial=expression_cycle_initial,
     cycle_fn=|db, cycle, previous: &ExpressionInference<'db>, inference: ExpressionInference<'db>, input: InferExpression<'db>| {
-        let (expression, _) = input.into_inner(db);
+        let (expression, tcx) = input.into_inner(db);
         let env = ProgramEnvironment::from_scope(expression.scope(db));
-        inference.cycle_normalized(db, &env, previous, cycle)
+        let module = parsed_module(db, expression.program_file(db).python_file(db)).load(db);
+        let collection_root = (tcx.annotation.is_none() && matches!(
+            expression.node_ref(db).node(&module), ast::Expr::List(_) | ast::Expr::Set(_) | ast::Expr::Dict(_)
+        )).then(|| expression.node_ref(db).into());
+        inference.cycle_normalized(db, &env, previous, cycle, collection_root)
     },
     heap_size=ruff_memory_usage::heap_size
 )]
@@ -1179,6 +1204,23 @@ impl<'db> DefinitionTypes<'db> {
         definition: Definition<'db>,
         ty: Type<'db>,
     ) -> Type<'db> {
+        if let DefinitionKind::Assignment(assignment) = definition.kind(db) {
+            let module = parsed_module(db, definition.program_file(db).python_file(db)).load(db);
+            if matches!(
+                assignment.value(&module),
+                ast::Expr::List(_) | ast::Expr::Set(_) | ast::Expr::Dict(_)
+            ) {
+                return normalize_collection_elements(
+                    db,
+                    env,
+                    ty,
+                    previous
+                        .binding_type(owner, definition)
+                        .unwrap_or(Type::unknown()),
+                    cycle,
+                );
+            }
+        }
         if let Some(previous_ty) = previous.binding_type(owner, definition) {
             ty.cycle_normalized(db, env, previous_ty, cycle)
         } else {
@@ -1929,6 +1971,7 @@ impl<'db> ExpressionInference<'db> {
         env: &ProgramEnvironment<'db>,
         previous: &ExpressionInference<'db>,
         cycle: &salsa::Cycle,
+        collection_root: Option<ExpressionNodeKey>,
     ) -> ExpressionInference<'db> {
         if let Some(extra) = self.extra.as_mut() {
             for (binding, binding_ty) in &mut extra.bindings {
@@ -1951,7 +1994,11 @@ impl<'db> ExpressionInference<'db> {
 
         for (expr, ty) in &mut self.expressions {
             let previous_ty = previous.expression_type(*expr);
-            *ty = ty.cycle_normalized(db, env, previous_ty, cycle);
+            *ty = if Some(*expr) == collection_root {
+                normalize_collection_elements(db, env, *ty, previous_ty, cycle)
+            } else {
+                ty.cycle_normalized(db, env, previous_ty, cycle)
+            };
         }
 
         if cycle.iteration() > crate::TAINTED_CYCLES

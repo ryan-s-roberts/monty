@@ -3393,13 +3393,16 @@ pub(crate) struct CallableBinding<'db> {
     ///    for all of the argument lists, or
     /// 2. Overload call evaluation was ambiguous, meaning that multiple overloads matched the
     ///    argument lists, but their return types were not equivalent, or
-    /// 3. Argument type expansion reached its limit.
+    /// 3. Argument type expansion reached its limit, or
+    /// 4. Cycle markers prevent a conclusive choice during inference.
     ///
     /// For (1), the final return type is the union of all the return types of the matched
     /// overloads for the expanded argument lists. We also retain the overloads selected for
     /// deprecation reporting without discarding the other matches used for argument inference.
     ///
     /// For (2) and (3), the final return type is [`Unknown`].
+    /// For (4), candidate returns remain a provisional union. This preserves
+    /// finite evidence for the fixed point without declaring the call ambiguous.
     ///
     /// [`Unknown`]: crate::types::DynamicType::Unknown
     overload_call_result: Option<OverloadCallResult<'db>>,
@@ -4286,6 +4289,30 @@ impl<'db> CallableBinding<'db> {
             })
             .collect::<Vec<_>>();
 
+        // A cycle marker is a pending inference result, not a materialized
+        // argument/parameter type. It cannot prove that the first overload
+        // covers all alternatives. Preserve their lower evidence until the
+        // fixed point closes, rather than feeding a selected marker back into
+        // mutable collection inference.
+        if matching_overload_slots
+            .iter()
+            .flat_map(|(_, slots)| slots)
+            .any(|slot| {
+                [slot.argument, slot.parameter]
+                    .into_iter()
+                    .any(|ty| any_over_type(db, env, ty, false, |ty| ty.is_divergent()))
+            })
+        {
+            let return_type = UnionType::from_elements(
+                db,
+                env,
+                self.matching_overloads()
+                    .map(|(_, overload)| overload.return_type()),
+            );
+            self.overload_call_result = Some(OverloadCallResult::PendingInference(return_type));
+            return false;
+        }
+
         let max_slot_count = matching_overload_slots
             .iter()
             .map(|(_, slots)| slots.len())
@@ -4542,7 +4569,7 @@ impl<'db> CallableBinding<'db> {
             OverloadCallResult::ArgumentTypeExpansion(expanded) => {
                 expanded.selected_overloads.contains(index)
             }
-            OverloadCallResult::Ambiguous => true,
+            OverloadCallResult::Ambiguous | OverloadCallResult::PendingInference(_) => true,
             OverloadCallResult::ArgumentTypeExpansionLimitReached(_) => false,
         }))
     }
@@ -4626,6 +4653,7 @@ impl<'db> CallableBinding<'db> {
                 OverloadCallResult::ArgumentTypeExpansion(expanded) => expanded.return_type,
                 OverloadCallResult::ArgumentTypeExpansionLimitReached(_) => Type::unknown(),
                 OverloadCallResult::Ambiguous => Type::Dynamic(DynamicType::AmbiguousOverload),
+                OverloadCallResult::PendingInference(return_type) => *return_type,
             };
         }
         if let Some((_, first_overload)) = self.matching_overloads().next() {
@@ -4874,6 +4902,8 @@ impl<'db> IntoIterator for CallableBinding<'db> {
 /// An overload call whose result requires more than the first matching signature.
 #[derive(Debug, Clone)]
 enum OverloadCallResult<'db> {
+    /// Candidates cannot be ordered conclusively while inference contains cycle markers.
+    PendingInference(Type<'db>),
     /// Successful argument expansion, boxed to keep other call bindings small.
     ArgumentTypeExpansion(Box<ExpandedOverloadCall<'db>>),
     /// Argument expansion stopped at this argument's expansion limit.

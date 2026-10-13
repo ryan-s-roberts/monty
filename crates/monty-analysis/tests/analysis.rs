@@ -29,6 +29,125 @@ fn instance(node: &Node, name: &str) {
 }
 
 #[test]
+fn dictionary_accumulation_exports_converged_element_types() {
+    for initializer in ["{}", "{'open': 0}"] {
+        let source = format!(
+            "def count(rows: list[str]):\n    totals = {initializer}\n    for row in rows:\n        totals[row] = totals.get(row, 0) + 1\n    for row in rows:\n        if totals[row] >= 2:\n            return (row, totals[row])\n    return ('none', 0)\n"
+        );
+        let result = monty_analysis::analyze_function(
+            &AnalysisRequest {
+                source,
+                stubs: None,
+                targets: Vec::new(),
+                limits: AnalysisLimits::default(),
+            },
+            "count",
+        )
+        .unwrap();
+        let AnalysisOutcome::Inferred(graph) = result.outcome else {
+            panic!("dictionary accumulation must infer");
+        };
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| matches!(node, Node::Unsupported | Node::Unknown | Node::Any)),
+            "{initializer}: {graph:?}"
+        );
+    }
+}
+
+#[test]
+fn mutable_collection_element_equations_close_without_gradual_types() {
+    for (initializer, default, update, expected) in [
+        ("{}", "0", " + 1", "int"),
+        ("{'a': 0}", "0", " + 2", "int"),
+        ("{}", "1", " * 2", "int"),
+        ("{}", "''", " + key", "str"),
+        ("{'a': ''}", "''", " + key", "str"),
+    ] {
+        let source = format!(
+            "def collect(keys: list[str]):\n    values = {initializer}\n    for key in keys:\n        values[key] = values.get(key, {default}){update}\n    return values\n"
+        );
+        let result = monty_analysis::analyze_function(
+            &AnalysisRequest {
+                source,
+                stubs: None,
+                targets: vec![],
+                limits: AnalysisLimits::default(),
+            },
+            "collect",
+        )
+        .unwrap();
+        let AnalysisOutcome::Inferred(graph) = result.outcome else {
+            panic!("collection equations must infer");
+        };
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| matches!(node, Node::Unsupported | Node::Unknown | Node::Any)),
+            "{initializer}/{update}: {graph:?}"
+        );
+        instance(root(&graph), "dict");
+        let Node::Instance { arguments, .. } = root(&graph) else {
+            unreachable!()
+        };
+        assert_eq!(arguments.len(), 2);
+        instance(&graph.nodes[arguments[0].0 as usize], "str");
+        instance(&graph.nodes[arguments[1].0 as usize], expected);
+    }
+}
+
+#[test]
+fn recursive_mutable_collection_remains_explicitly_unresolved() {
+    let source = "def recursive():\n    values = []\n    values.append(values)\n    return values\n";
+    let result = monty_analysis::analyze_function(
+        &AnalysisRequest {
+            source: source.into(),
+            stubs: None,
+            targets: vec![],
+            limits: AnalysisLimits::default(),
+        },
+        "recursive",
+    )
+    .unwrap();
+    let AnalysisOutcome::Inferred(graph) = result.outcome else {
+        return;
+    };
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node, Node::Unsupported | Node::Unknown)),
+        "recursive values must not acquire a closed finite contract: {graph:?}"
+    );
+}
+
+#[test]
+fn resolved_collection_types_still_reject_incompatible_updates() {
+    for initializer in ["values: dict[str, int] = {}", "values = {'a': ''}"] {
+        let source = format!(
+            "def collect(keys: list[str]):\n    {initializer}\n    for key in keys:\n        values[key] = values.get(key, 'bad') + 1\n    return values\n"
+        );
+        let result = monty_analysis::analyze_function(
+            &AnalysisRequest {
+                source,
+                stubs: None,
+                targets: vec![],
+                limits: AnalysisLimits::default(),
+            },
+            "collect",
+        )
+        .unwrap();
+        assert!(
+            matches!(result.outcome, AnalysisOutcome::Rejected(_)),
+            "incompatible value updates must reject"
+        );
+    }
+}
+
+#[test]
 fn nullable_coalescing_and_method_membership_are_python() {
     let expression = "'grocery' in (description or '').lower()";
     let source = format!("def check(description: str | None) -> bool:\n    return {expression}\n");
