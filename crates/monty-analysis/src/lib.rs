@@ -452,6 +452,60 @@ fn inspect_function_at<T>(
 mod callable_evidence_tests {
     use super::*;
     #[test]
+    fn dictionary_held_mutable_list_has_a_closed_type_graph() {
+        let result = analyze_function(
+            &AnalysisRequest {
+                source: "def pack():\n    result = {'items': []}\n    result['items'].append(1)\n    return result\n"
+                    .into(),
+                stubs: None,
+                targets: vec![],
+                limits: AnalysisLimits::default(),
+            },
+            "pack",
+        )
+        .unwrap();
+        let AnalysisOutcome::Inferred(graph) = result.outcome else {
+            panic!("expected inferred graph");
+        };
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| matches!(node, Node::Unsupported | Node::Unknown | Node::Any)),
+            "{graph:?}"
+        );
+    }
+
+    #[test]
+    fn nested_container_mutations_preserve_each_axis() {
+        for body in [
+            "    result = {'items': [[]]}\n    result['items'][0].append(1)\n    return result\n",
+            "    result = {'items': [{}]}\n    result['items'][0]['amount'] = 1\n    return result\n",
+            "    result = {'title': 'a', 'items': []}\n    result['items'].append(1)\n    return result\n",
+        ] {
+            let result = analyze_function(
+                &AnalysisRequest {
+                    source: format!("def pack():\n{body}"),
+                    stubs: None,
+                    targets: vec![],
+                    limits: AnalysisLimits::default(),
+                },
+                "pack",
+            )
+            .unwrap();
+            let AnalysisOutcome::Inferred(graph) = result.outcome else {
+                panic!("expected inferred graph for {body}: {:?}", result.outcome);
+            };
+            assert!(
+                !graph
+                    .nodes
+                    .iter()
+                    .any(|node| matches!(node, Node::Unsupported | Node::Unknown | Node::Any)),
+                "{body}: {graph:?}"
+            );
+        }
+    }
+    #[test]
     fn lexical_syntax_preserves_checker_and_parser_causes() {
         use std::error::Error;
         let error = bind_one_positional("def callback(:\n    pass\n").unwrap_err();

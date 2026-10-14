@@ -7527,7 +7527,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // We use a forward assignability check (`identity_instance ≤ tcx`) to infer what each
         // typevar maps to in the type context. For example, if the type context is `list[int]` and
         // `collection_instance` is `list[T]`, the check produces `T = int`.
-        let (elt_tcx_constraints, elt_tcx_variance) = {
+        let (mut elt_tcx_constraints, mut elt_tcx_variance) = {
             let mut elt_tcx_constraints: FxHashMap<
                 BoundTypeVarIdentity<'db>,
                 UnionAccumulator<'db>,
@@ -7758,6 +7758,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         }
 
+        let mut projected_context = false;
         if tcx.annotation.is_none()
             && let Some(collection_expr) = collection_expr
             && let InferenceRegion::Expression(current_expr, _) = self.region
@@ -7801,6 +7802,32 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         }
 
                         builder.infer(identity_instance, *constraint).ok()?;
+                        // Mutation evidence must reach nested initializers,
+                        // rather than leave an independent Unknown element
+                        // beside the solved receiver type in the outer union.
+                        if elts.iter().flatten().flatten().any(|expr| {
+                            matches!(
+                                expr,
+                                ast::Expr::List(_) | ast::Expr::Set(_) | ast::Expr::Dict(_)
+                            )
+                        }) && let Some(specialization) =
+                            constraint.known_specialization(db, env, collection_class)
+                        {
+                            for (variable, ty) in
+                                generic_context.variables(db).zip(specialization.types(db))
+                            {
+                                let identity = variable.identity(db);
+                                elt_tcx_constraints
+                                    .entry(identity)
+                                    .and_modify(|existing| {
+                                        *existing =
+                                            UnionType::from_elements(db, env, [*existing, *ty]);
+                                    })
+                                    .or_insert(*ty);
+                                elt_tcx_variance.insert(identity, TypeVarVariance::Invariant);
+                            }
+                            projected_context = true;
+                        }
                     }
                 }
             }
@@ -7879,6 +7906,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 let inferred_elt_ty = pre_inferred_elt_tys
                     .as_ref()
+                    .filter(|_| !projected_context)
                     .and_then(|inferred_elts| inferred_elts[elts_index][i])
                     .unwrap_or_else(|| {
                         infer_elt_expression(self, (i, elt, TypeContext::new(elt_tcx)))
@@ -8916,6 +8944,61 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         Some(constraint)
     }
 
+    /// Project a nested receiver's evidence back onto its owning initializer.
+    /// Each lookup removes one container axis; mutation must put those axes
+    /// back before recording a constraint on the root collection definition.
+    fn collection_receiver(
+        &self,
+        mut receiver: &ast::Expr,
+    ) -> Option<(Definition<'db>, Vec<(KnownClass, Option<Type<'db>>)>)> {
+        let db = self.db();
+        let env = self.program_environment();
+        let mut path = Vec::new();
+        loop {
+            if let Some(definition) = self.index.unannotated_collection_initializer(receiver) {
+                return Some((definition, path));
+            }
+            let ast::Expr::Subscript(subscript) = receiver else {
+                return None;
+            };
+            let container = self.expression_type(&subscript.value);
+            let axis = if container
+                .known_specialization(db, env, KnownClass::Dict)
+                .is_some()
+            {
+                (
+                    KnownClass::Dict,
+                    Some(self.expression_type(&subscript.slice).promote(db, env)),
+                )
+            } else if container
+                .known_specialization(db, env, KnownClass::List)
+                .is_some()
+            {
+                (KnownClass::List, None)
+            } else {
+                return None;
+            };
+            path.push(axis);
+            receiver = &subscript.value;
+        }
+    }
+
+    fn project_collection_constraint(
+        &self,
+        mut constraint: Type<'db>,
+        path: &[(KnownClass, Option<Type<'db>>)],
+    ) -> Type<'db> {
+        let db = self.db();
+        let env = self.program_environment();
+        for (class, key) in path {
+            constraint = match key {
+                Some(key) => class.to_specialized_instance(db, env, &[*key, constraint]),
+                None => class.to_specialized_instance(db, env, &[constraint]),
+            };
+        }
+        constraint
+    }
+
     fn infer_call_expression(
         &mut self,
         call_expression: &ast::ExprCall,
@@ -9611,7 +9694,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         if let ast::Expr::Attribute(attribute @ ast::ExprAttribute { value, .. }) = func.as_ref() {
             let value_type = self.expression_type(value);
 
-            if let Some(collection_def) = self.index.unannotated_collection_initializer(value)
+            if let Some((collection_def, receiver_path)) = self.collection_receiver(value)
                 && let Some((collection_literal, _)) = value_type.class_specialization(db, env)
             {
                 let identity_instance =
@@ -9659,6 +9742,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         ) else {
                             continue;
                         };
+
+                        let constraints =
+                            self.project_collection_constraint(constraints, &receiver_path);
 
                         self.collection_use_constraints
                             .entry(collection_def)
@@ -11574,7 +11660,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             compare.iter(),
             |_| false,
             |builder, (left, op, right), _peer_ty| {
-                let left_ty = next_left_ty.take().unwrap_or_else(|| builder.expression_type(left));
+                let left_ty = next_left_ty
+                    .take()
+                    .unwrap_or_else(|| builder.expression_type(left));
                 let right_ty = builder.infer_expression(right, TypeContext::default());
 
                 let range = TextRange::new(left.start(), right.end());
@@ -11610,14 +11698,27 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 // Python reuses the middle value, so its original AST node still
                 // carries its pre-guard type. Use the same constraint algebra as
                 // branch narrowing for the next comparison, without re-evaluation.
-                next_left_ty = Some(crate::types::narrow::comparison_constraint(
-                    db, builder.program_environment(), right_ty, left_ty, *op, true,
-                    crate::types::equality::ComparisonSoundnessPolicy::from_analysis_settings(
-                        db.analysis_settings(builder.scope.file(db)),
-                    ),
-                ).map_or(right_ty, |constraint| IntersectionType::from_two_elements(
-                    db, builder.program_environment(), right_ty, constraint,
-                )));
+                next_left_ty = Some(
+                    crate::types::narrow::comparison_constraint(
+                        db,
+                        builder.program_environment(),
+                        right_ty,
+                        left_ty,
+                        *op,
+                        true,
+                        crate::types::equality::ComparisonSoundnessPolicy::from_analysis_settings(
+                            db.analysis_settings(builder.scope.file(db)),
+                        ),
+                    )
+                    .map_or(right_ty, |constraint| {
+                        IntersectionType::from_two_elements(
+                            db,
+                            builder.program_environment(),
+                            right_ty,
+                            constraint,
+                        )
+                    }),
+                );
                 last_comparison_ty = ty;
                 (ty, range)
             },

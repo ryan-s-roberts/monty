@@ -1624,7 +1624,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // Record the constraints for the object of the subscript assignment, if the object is an
         // unannotated collection initializer.
         if is_valid_assignment
-            && let Some(collection_def) = self.index.unannotated_collection_initializer(object)
+            && let Some((collection_def, receiver_path)) = self.collection_receiver(object)
             && let Some((class_literal, _)) = object_ty.class_specialization(db, env)
         {
             let identity_instance =
@@ -1692,6 +1692,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         ) else {
                             continue;
                         };
+
+                        let constraints =
+                            self.project_collection_constraint(constraints, &receiver_path);
 
                         self.collection_use_constraints
                             .entry(collection_def)

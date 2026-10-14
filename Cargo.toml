@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["vendor/ty_python_semantic"]
+exclude = ["vendor/ty_python_semantic", "vendor/ty_python_core"]
 members = [
     "crates/monty",
     "crates/monty-types",
@@ -193,4 +193,5 @@ similar_names = "allow"
 too_many_lines = "allow"
 
 [patch.crates-io]
+ty_python_core = { path = "vendor/ty_python_core" }
 ty_python_semantic = { path = "vendor/ty_python_semantic" }
