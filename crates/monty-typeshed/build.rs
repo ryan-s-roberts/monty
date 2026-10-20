@@ -49,9 +49,10 @@ fn write_zipped_typeshed_to(writer: File) -> ZipResult<File> {
 
     let options = FileOptions::default()
         .compression_method(method)
+        .last_modified_time(zip::DateTime::default())
         .unix_permissions(0o644);
 
-    for entry in walkdir::WalkDir::new(TYPESHED_SOURCE_DIR) {
+    for entry in walkdir::WalkDir::new(TYPESHED_SOURCE_DIR).sort_by_file_name() {
         let dir_entry = entry.unwrap();
         let absolute_path = dir_entry.path();
         let normalized_relative_path = absolute_path
